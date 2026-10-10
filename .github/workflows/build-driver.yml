@@ -121,22 +121,54 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path "$PWD\out" | Out-Null
 
+          # Response files: PowerShell's native-argument handling can mangle
+          # MSVC-style /flags, and these are the flags that actually matter
+          # (/kernel for _KERNEL_MODE, /arch:x64 so ntdef.h sees _AMD64_).
+          $cflags = Join-Path $PWD 'out\c.rsp'
+          @(
+            '/nologo', '/c', '/W0', '/kernel', '/arch:x64', '/GS-', '/Gs-', '/guard:cf-',
+            "/I`"$kmDir`"", "/I`"$sharedDir`"", "/Fo`"$PWD\out\`""
+          ) | Set-Content -Path $cflags -Encoding ascii
+
+          $ldflags = Join-Path $PWD 'out\l.rsp'
+          @(
+            '/nologo', '/driver', '/subsystem:native', '/entry:DriverEntry', '/machine:x64',
+            "/out:`"$PWD\out\codmdrv.sys`"",
+            "/libpath:`"$(Join-Path $kitsRoot "Lib\$kit\km\x64")`"",
+            "`"$PWD\out\driver.obj`"", "`"$PWD\out\pagewalk.obj`"",
+            'ntoskrnl.lib', 'hal.lib'
+          ) | Set-Content -Path $ldflags -Encoding ascii
+
+          Write-Host "=== c.rsp ==="; Get-Content $cflags | ForEach-Object { Write-Host "  $_" }
+
+          # Dump the predefined macros so a target-architecture failure is
+          # diagnosable from the log without a second round trip.
+          Write-Host "=== arch macro probe ==="
+          $probe = Join-Path $PWD 'out\probe.c'
+          @'
+#if defined(_AMD64_)
+#pragma message("ARCH _AMD64_ DEFINED")
+#else
+#pragma message("ARCH _AMD64_ NOT DEFINED")
+#endif
+#if defined(_KERNEL_MODE)
+#pragma message("KERNEL MODE DEFINED")
+#else
+#pragma message("KERNEL MODE NOT DEFINED")
+#endif
+#if defined(_WIN64)
+#pragma message("WIN64 DEFINED")
+#endif
+'@ | Set-Content -Path $probe -Encoding ascii
+          & cl.exe /nologo /c /W0 "/kernel" "/arch:x64" "/Fo`"$PWD\out\probe.obj`"" $probe 2>&1 |
+              ForEach-Object { Write-Host "  probe: $_" }
+
           Write-Host "=== compiling ==="
-          # /kernel sets _KERNEL_MODE; /arch:x64 sets _AMD64_. ntdef.h's
-          # PROBE_ALIGNMENT branch requires _AMD64_/_X86_/_ARM64EC_, and
-          # raises "#error No Target Architecture" when none is defined --
-          # in kernel mode MSVC does not define the arch macro implicitly.
-          & cl.exe /nologo /c /W0 /kernel /arch:x64 /GS- /Gs- /guard:cf- `
-                    "/I$kmDir" "/I$sharedDir" "/Fo$PWD\out\\" `
-                    driver\driver.c driver\pagewalk.c
+          & cl.exe "@$cflags" driver\driver.c driver\pagewalk.c
           if ($LASTEXITCODE -ne 0) { throw "cl failed: $LASTEXITCODE" }
 
           Write-Host "=== linking ==="
-          & link.exe /nologo /driver /subsystem:native /entry:DriverEntry `
-                     /machine:x64 "/out:$PWD\out\codmdrv.sys" `
-                     "/libpath:$(Join-Path $kitsRoot "Lib\$kit\km\x64")" `
-                     "$PWD\out\driver.obj" "$PWD\out\pagewalk.obj" `
-                     ntoskrnl.lib hal.lib
+          & link.exe "@$ldflags"
           if ($LASTEXITCODE -ne 0) { throw "link failed: $LASTEXITCODE" }
 
           Get-Item "$PWD\out\codmdrv.sys" | Select-Object Name, Length
