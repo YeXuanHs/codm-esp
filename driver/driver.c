@@ -24,6 +24,7 @@
 #include "ntddk.h"
 #include "ntstatus.h"     // STATUS_DEVICE_STATE_ERROR and friends
 #include "ntstrsafe.h"
+#include "ntseapi.h"      // SECURITY_DESCRIPTOR / ACL layout
 #include "pagewalk.h"
 #include "../common/protocol.h"
 
@@ -386,38 +387,45 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return status;
 
     // Restrict the device to administrators. Without an explicit DACL the
-    // device would inherit whatever the \Device namespace default is, which on
-    // a workstation build is more permissive than we want.
+    // device inherits the \Device namespace default, which on a workstation
+    // build is more permissive than we want. The EXPLICIT_ACCESS helpers live
+    // in headers this driver does not pull in, so the ACL is built directly
+    // from ACCESS_ALLOWED_ACE -- the grant is a single well-known SID.
     {
-        SECURITY_DESCRIPTOR sd;
-        PACL                acl = NULL;
-        EXPLICIT_ACCESS     ea[1];
-        ULONG               ea_len = sizeof(ea);
+        SECURITY_DESCRIPTOR   sd;
+        PACL                  acl  = NULL;
+        const ACCESS_MASK     mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        const ULONG           acl_size =
+            FIELD_OFFSET(ACL, Aces) + sizeof(ACCESS_ALLOWED_ACE) -
+            sizeof(ULONG);          // header has a trailing alignment hole
 
-        RtlZeroMemory(ea, sizeof(ea));
-        ea[0].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-        ea[0].grfAccessMode         = GRANT_ACCESS;
-        ea[0].Trustee.TrusteeForm   = TRUSTEE_IS_SID;
-        ea[0].Trustee.TrusteeType   = TRUSTEE_IS_WELL_KNOWN_GROUP;
-        ea[0].Trustee.TrusteeValue  = WinBuiltinAdministratorsSid;
+        acl = (PACL)ExAllocatePool2(NonPagedPool, acl_size, CODMDRV_POOL_TAG);
+        if (!acl)
+            return STATUS_INSUFFICIENT_RESOURCES;
 
-        status = RtlCreateAcl(&acl, 1, 2 /* ACL_REVISION */);
-        if (NT_SUCCESS(status)) {
-            status = RtlAddAccessAllowedAce(acl, 2, ea[0].grfAccessPermissions,
-                                            ea[0].Trustee.TrusteeValue);
+        RtlZeroMemory(acl, acl_size);
+        acl->Revision = ACL_REVISION;
+        acl->AcesCount = 1;
+        acl->AceSize   = sizeof(ACCESS_ALLOWED_ACE);
+
+        {
+            PACCESS_ALLOWED_ACE ace = (PACCESS_ALLOWED_ACE)(acl + 1);
+            ace->AceType      = ACCESS_ALLOWED_ACE_TYPE;
+            ace->AceFlags     = 0;
+            ace->AceSize      = sizeof(ACCESS_ALLOWED_ACE);
+            ace->Mask         = mask;
+            RtlCopyMemory(ace->SidStart, WinBuiltinAdministratorsSid,
+                          RtlLengthSid(WinBuiltinAdministratorsSid));
         }
-        if (NT_SUCCESS(status)) {
-            RtlInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-            status = RtlSetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE);
-        }
-        if (acl)
-            ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
-        if (!NT_SUCCESS(status)) {
-            IoDeleteDevice(g_device);
-            g_device = NULL;
-            return status;
-        }
+
+        RtlZeroMemory(&sd, sizeof(sd));
+        sd.Revision = SECURITY_DESCRIPTOR_REVISION;
+        sd.Control  = SE_DACL_PRESENT;
+        sd.Dacl     = acl;
+
         status = IoSetDeviceObjectSecurity(g_device, &sd, FALSE);
+
+        ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
         if (!NT_SUCCESS(status)) {
             IoDeleteDevice(g_device);
             g_device = NULL;
