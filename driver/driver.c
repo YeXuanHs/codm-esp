@@ -39,9 +39,35 @@
 #define STATUS_NO_MORE_ENTRIES     ((NTSTATUS)0x8000001AL)
 #endif
 
+// pagewalk.h supplies u8/u32/u64 aliases; driver.c also uses the stdint-style
+// names, so make sure they are declared before first use.
+typedef UINT8  uint8_t;
+typedef UINT32 uint32_t;
+typedef UINT64 uint64_t;
+
+// Kernel mode does not pull in the SID constant macros, so define the two we
+// need. Values are fixed by the Windows security model:
+//   SECURITY_NT_AUTHORITY   = { 0,0,0,0,0,5 }
+//   DOMAIN_ALIAS_RID_ADMINS = 0x220 (544)
+// SECURITY_BUILTIN_DOMAIN_RID = 0x20 (32)
+#ifndef SECURITY_NT_AUTHORITY
+#define SECURITY_NT_AUTHORITY  { 0, 0, 0, 0, 0, 5 }
+#endif
+#ifndef SECURITY_BUILTIN_DOMAIN_RID
+#define SECURITY_BUILTIN_DOMAIN_RID  0x00000020UL
+#endif
+#ifndef DOMAIN_ALIAS_RID_ADMINS
+#define DOMAIN_ALIAS_RID_ADMINS      0x00000220UL
+#endif
+
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
 NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 NTSTATUS PsGetNextProcess(PEPROCESS Process);
+
+// Defined at the bottom of this file. Declared here so the compiler sees one
+// consistent signature for both.
+void XteaDecrypt(uint8_t* buf, SIZE_T words);
+void XteaEncrypt(uint8_t* buf, SIZE_T words);
 
 //-----------------------------------------------------------------------------
 // Global state
@@ -381,26 +407,30 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     // IoCreateDeviceSecure builds the administrator-only DACL for us from a
     // SID descriptor, avoiding a hand-rolled ACL (and the extra headers that
-    // would need). sd = SECURITY_DESCRIPTOR_REVISION implies the ACL is
-    // present; the well-known Administrators SID is what gets access.
+    // would need).
     {
-        static const SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
-        static const UCHAR admin_subauth_count = 2;
-        static const UCHAR admin_subauth[2] = { SECURITY_BUILTIN_DOMAIN_RID,
-                                                DOMAIN_ALIAS_RID_ADMINS };
-        NTSTATUS sec;
+        SID_IDENTIFIER_AUTHORITY nt_auth;
+        UCHAR                     admin_subauth[2];
+        NTSTATUS                 sec;
+
+        RtlZeroMemory(&nt_auth, sizeof(nt_auth));
+        nt_auth.Value[5] = 5;                 // SECURITY_NT_AUTHORITY
+
+        admin_subauth[0] = (UCHAR)SECURITY_BUILTIN_DOMAIN_RID;
+        admin_subauth[1] = (UCHAR)DOMAIN_ALIAS_RID_ADMINS;
 
         status = IoCreateDeviceSecure(
             DriverObject, 0, &dev_name,
             FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-            &nt_authority, admin_subauth_count, admin_subauth,
-            NULL,          // no default ACL supplied; the SID list drives it
+            &nt_auth,
+            2,                                  // sub-authority count
+            admin_subauth,
+            NULL,                               // no caller-supplied default ACL
             &g_device);
 
         if (!NT_SUCCESS(status))
             return status;
 
-        // Preserve the create status; the block below only touches the symlink.
         sec = status;
         if (!NT_SUCCESS(sec))
             return sec;
