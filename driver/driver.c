@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -76,20 +76,28 @@ typedef UINT64 uint64_t;
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
 // Resolved dynamically so a build that lacks the export degrades to a clean
 // IOCTL error instead of failing to load.
+// Resolved at DriverEntry via MmGetSystemRoutineAddress rather than linked
+// directly: both are exported by ntoskrnl.exe but absent from ntoskrnl.lib's
+// public import set, so a static reference fails at link time.
 typedef NTSTATUS (NTAPI *PFN_NtQueryInformationProcess)(
     HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 typedef PEPROCESS (NTAPI *PFN_PsGetNextProcess)(PEPROCESS);
 typedef u64 (NTAPI *PFN_PsGetDirectoryTableBase)(PEPROCESS);
+typedef NTSTATUS (NTAPI *PFN_IoSetDeviceObjectSecurity)(
+    PDEVICE_OBJECT, PSECURITY_DESCRIPTOR, BOOLEAN);
 
 static PFN_NtQueryInformationProcess     pNtQueryInformationProcess = NULL;
 static PFN_PsGetNextProcess              pPsGetNextProcess = NULL;
 static PFN_PsGetDirectoryTableBase       pPsGetDirectoryTableBase = NULL;
+static PFN_IoSetDeviceObjectSecurity     pIoSetDeviceObjectSecurity = NULL;
 
-// MmGetDirectoryTableBase is the documented equivalent of the undocumented
-// PsGetDirectoryTableBase and IS exported from ntoskrnl.exe, so it links
-// directly; only the process-list walk needs a runtime lookup.
+// Fetch the target's page-directory base (CR3). Returns 0 if the helper is
+// unavailable, which the IOCTL layer reports as a device-state error rather
+// than faulting.
 static u64 GetCr3(PEPROCESS proc) {
-    return (u64)PsGetDirectoryTableBase(proc);
+    if (!pPsGetDirectoryTableBase || !proc)
+        return 0;
+    return pPsGetDirectoryTableBase(proc);
 }
 
 // Defined at the bottom of this file. Declared here so the compiler sees one
@@ -446,6 +454,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"PsGetNextProcess");
     pPsGetDirectoryTableBase = (PFN_PsGetDirectoryTableBase)
         MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"PsGetDirectoryTableBase");
+    pIoSetDeviceObjectSecurity = (PFN_IoSetDeviceObjectSecurity)
+        MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"IoSetDeviceObjectSecurity");
 
     // IoCreateDevice rather than IoCreateDeviceSecure: the latter is not
     // declared by the WDK headers used here and would not link.
@@ -494,7 +504,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
             sd.Revision = SECURITY_DESCRIPTOR_REVISION;
             sd.Control  = SE_DACL_PRESENT;
             sd.Dacl     = acl;
-            IoSetDeviceObjectSecurity(g_device, &sd, FALSE);
+            if (pIoSetDeviceObjectSecurity)
+                pIoSetDeviceObjectSecurity(g_device, &sd, FALSE);
         }
         if (acl)
             ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
@@ -576,6 +587,8 @@ void XteaEncrypt(uint8_t* buf, SIZE_T words) {
         v[1] = v1;
     }
 }
+
+
 
 
 
