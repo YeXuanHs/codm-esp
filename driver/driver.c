@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -58,17 +58,6 @@ typedef UINT64 uint64_t;
 #endif
 #ifndef DOMAIN_ALIAS_RID_ADMINS
 #define DOMAIN_ALIAS_RID_ADMINS      0x00000220UL
-#endif
-
-// SID_IDENTIFIER_AUTHORITY lives in ntioapi.h, which this driver does not
-// include. Its layout has been stable since NT: six big-endian bytes.
-typedef struct _SID_IDENTIFIER_AUTHORITY_LOCAL {
-    UCHAR Value[6];
-} SID_IDENTIFIER_AUTHORITY_LOCAL, *PSID_IDENTIFIER_AUTHORITY_LOCAL;
-
-// Some WDK headers spell the parameter type differently; alias it if needed.
-#ifndef PSID_IDENTIFIER_AUTHORITY
-typedef PSID_IDENTIFIER_AUTHORITY_LOCAL PSID_IDENTIFIER_AUTHORITY;
 #endif
 
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
@@ -420,7 +409,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     // SID descriptor, avoiding a hand-rolled ACL (and the extra headers that
     // would need).
     {
-        SID_IDENTIFIER_AUTHORITY_LOCAL nt_auth;
+        SID_IDENTIFIER_AUTHORITY nt_auth;
         UCHAR                     admin_subauth[2];
         NTSTATUS                 sec;
 
@@ -433,7 +422,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         status = IoCreateDeviceSecure(
             DriverObject, 0, &dev_name,
             FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-            (PSID_IDENTIFIER_AUTHORITY)&nt_auth,   // layout-identical to ours
+            &nt_auth,
             2,                                  // sub-authority count
             admin_subauth,
             NULL,                               // no caller-supplied default ACL
@@ -525,3 +514,5 @@ void XteaEncrypt(uint8_t* buf, SIZE_T words) {
         v[1] = v1;
     }
 }
+
+
