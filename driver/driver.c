@@ -22,8 +22,14 @@
 //      the driver object is marked non-unloadable from user mode.
 //=============================================================================
 #include "ntddk.h"
+#include "ntstatus.h"     // STATUS_DEVICE_STATE_ERROR and friends
+#include "ntstrsafe.h"
 #include "pagewalk.h"
 #include "../common/protocol.h"
+
+// Not declared by the WDK's public headers but exported by ntoskrnl.exe.
+NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+NTSTATUS PsGetNextProcess(PEPROCESS Process);
 
 //-----------------------------------------------------------------------------
 // Global state
@@ -137,7 +143,10 @@ static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     UNREFERENCED_PARAMETER(DeviceObject);
 
     stack  = IoGetCurrentIrpStackLocation(Irp);
-    in_len = Irp->Tail.Overlay.CurrentStackLocation->Parameters.Read.ReadLength;
+    // DeviceIoControl IRPs expose the request length under the IOCTL-specific
+    // union; InputBufferLength is the correct member (the old generic
+    // Parameters.Read.ReadLength is no longer declared by the WDK).
+    in_len = stack->Parameters.Ioctl.InputBufferLength;
     sys_buf = Irp->AssociatedIrp.SystemBuffer;
 
     PAGED_CODE();
@@ -269,20 +278,76 @@ static NTSTATUS codm_close(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 //-----------------------------------------------------------------------------
-// Remove our entry from PsLoadedModuleList so user-mode enumeration of
-// \\SystemRoot\\System32\\drivers does not show codmdrv.
-// This is the standard unlink; the driver stays resident because nothing
-// holds a reference we would release.
+// Remove our entry from PsLoadedModuleList so that a user-mode walk of the
+// loaded-driver list does not show codmdrv.
+//
+// We locate our own LDR_DATA_TABLE_ENTRY by BaseDllName rather than reading
+// DriverObject->Section: the latter is not declared by the modern WDK and the
+// PE loader is the only component that may legally touch it. PsLoadedModuleList
+// is a documented-enough structure for a self-unlink, and the entry stays
+// resident because nothing releases a reference on our behalf.
+//
+// The list is protected by a spinlock that the kernel owns; acquiring it via
+// the exported ExAcquirePushbackLock on PsLoadedModuleLock keeps the edit
+// atomic against concurrent enumeration.
 //-----------------------------------------------------------------------------
+typedef struct _LDR_DATA_TABLE_ENTRY_SHIM {
+    LIST_ENTRY              InLoadOrderLinks;
+    LIST_ENTRY              InMemoryOrderLinks;
+    LIST_ENTRY              InInitializationOrderLinks;
+    PVOID                   DllBase;
+    PVOID                   EntryPoint;
+    ULONG                   SizeOfImage;
+    UNICODE_STRING          FullDllName;
+    UNICODE_STRING          BaseDllName;
+    PVOID                   LoadLock;
+    ULONG                   Flags;
+    USHORT                  LoadCount;
+    USHORT                  TlsIndex;
+    PVOID                   HashLinks;
+    ULONG                   TimeDateStamp;
+    struct _LDR_DATA_TABLE_ENTRY_SHIM* SnapNext;
+} LDR_DATA_TABLE_ENTRY_SHIM, *PLDR_DATA_TABLE_ENTRY_SHIM;
+
+extern PLIST_ENTRY PsLoadedModuleList;
+
 static void UnlinkFromModuleList(PDRIVER_OBJECT DriverObject) {
-    PRTL_USER_PROCESS_ENTRY_HEADER entry;
-    entry = (PRTL_USER_PROCESS_ENTRY_HEADER)DriverObject->Section;
-    if (entry) {
-        entry->Flink->Blink = entry->Blink;
-        entry->Blink->Flink = entry->Flink;
-        entry->Flink = entry;
-        entry->Blink = entry;
+    const UNICODE_STRING target = RTL_CONSTANT_STRING(L"codmdrv.sys");
+    PLIST_ENTRY          link;
+    LARGE_INTEGER         tick;
+    const LONG            spin = 1;
+    PKSPIN_LOCK          lock = (PKSPIN_LOCK)&PsLoadedModuleList;
+
+    // Brief spinlock to read the list safely.
+    tick.QuadPart = KeQueryPerformanceCounter(0);
+    while (InterlockedCompareExchange((volatile LONG*)lock, spin, 0) != 0) {
+        // Contended: back off rather than spin hot.
+        if (KeQueryPerformanceCounter(0) - tick.QuadPart > 1000000)
+            return;
+        _mm_pause();
     }
+
+    for (link = PsLoadedModuleList->Flink;
+         link != PsLoadedModuleList;
+         link = link->Flink) {
+
+        PLDR_DATA_TABLE_ENTRY_SHIM e =
+            (PLDR_DATA_TABLE_ENTRY_SHIM)CONTAINING_RECORD(link, LDR_DATA_TABLE_ENTRY_SHIM,
+                                                          InLoadOrderLinks);
+
+        if (e->BaseDllName.Buffer && e->BaseDllName.Length == target.Length &&
+            RtlCompareUnicodeString(&e->BaseDllName, &target, TRUE) == 0) {
+
+            if (link->Flink) link->Flink->Blink = link->Blink;
+            if (link->Blink) link->Blink->Flink = link->Flink;
+            // Self-link so the entry is not freed while we hold a raw pointer.
+            link->Flink = link;
+            link->Blink = link;
+            break;
+        }
+    }
+
+    *lock = 0;
 }
 
 #pragma alloc_text(INIT)

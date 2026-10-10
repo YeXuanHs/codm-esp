@@ -110,8 +110,12 @@ typedef struct _CODM_BODY_PING {
 #pragma pack(pop)
 
 //-----------------------------------------------------------------------------
-// User-mode side helpers (implemented in esp.exe / dumper.exe)
+// User-mode side helpers.
+//
+// These are C++ conveniences used only by esp.exe / dumper.exe. The driver
+// includes this header too, so they must be excluded from C translation units.
 //-----------------------------------------------------------------------------
+#if defined(__cplusplus)
 namespace codm {
 
 // XTEA block cipher, ECB, 32 rounds. Mirrors the kernel implementation.
@@ -140,7 +144,7 @@ public:
 
     HANDLE handle() const { return h_; }
 private:
-    bool transact(IOCTL_CODES code, void* body, uint32_t size);
+    bool transact(unsigned long code, void* body, uint32_t size);
     HANDLE h_ = INVALID_HANDLE_VALUE;
     uint32_t seq_ = 0;
 };
@@ -153,3 +157,4 @@ bool read_file(const wchar_t* path, std::vector<uint8_t>& out);
 void write_file(const wchar_t* path, const uint8_t* data, size_t size);
 
 } // namespace codm
+#endif // __cplusplus
