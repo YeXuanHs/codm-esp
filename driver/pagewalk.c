@@ -1,4 +1,4 @@
-﻿//=============================================================================
+//=============================================================================
 //  driver/pagewalk.c
 //  CR3-based page-table walker used to read CODM.exe memory WITHOUT ever
 //  opening a handle to it.
@@ -222,27 +222,37 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
 // frame succeeds and the fault happens on first touch, which is a bugcheck.
 //-----------------------------------------------------------------------------
 u64 PhysAddrLimit(void) {
-    // The largest RAM the firmware reports, plus the MMIO window that sits
-    // above it. Clamped so a bogus firmware value cannot disable the check.
     static volatile u64 cached = 0;
     u64 limit;
 
     if (cached != 0)
         return cached;
 
+    // MmGetMaximumPhysicalAddress is exported by ntoskrnl.exe but is not part
+    // of ntoskrnl.lib's public import set, so it is resolved at first use
+    // rather than linked. If the lookup fails we fall back to a 64 TB cap --
+    // far above any real frame number on this class of machine, yet still low
+    // enough to reject the garbage a torn-down address space produces.
     {
-        PHYSICAL_ADDRESS maxAddr;
-        maxAddr.QuadPart = (LONGLONG)-1;
-        {
-            u64 v = (u64)MmGetMaximumPhysicalAddress();
-            if (v == 0 || v > (1ULL << 46))
-                v = (1ULL << 46);          // 64 TB sanity cap
-            limit = v;
+        typedef PHYSICAL_ADDRESS (NTAPI *PFN_GetMaxPhys)(void);
+        static PFN_GetMaxPhys     pGetMaxPhys = NULL;
+        static volatile LONG      resolved   = 0;
+
+        if (InterlockedCompareExchange(&resolved, 1, 0) == 0) {
+            pGetMaxPhys = (PFN_GetMaxPhys)MmGetSystemRoutineAddress(
+                (PVOID)(ULONG_PTR)"MmGetMaximumPhysicalAddress");
+        }
+
+        if (pGetMaxPhys) {
+            PHYSICAL_ADDRESS maxAddr = pGetMaxPhys();
+            limit = (u64)maxAddr.QuadPart;
+        } else {
+            limit = 0;
         }
     }
 
-    if (limit < (1ULL << 20))              // < 1 MB is nonsense
-        limit = (1ULL << 20);
+    if (limit < (1ULL << 32))       // < 4 GB reported: use the 64 TB fallback
+        limit = (1ULL << 46);
 
     cached = limit;
     return limit;
