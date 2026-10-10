@@ -3,7 +3,9 @@
 //=============================================================================
 #pragma once
 
-#include <ntddk.h>
+// ntifs.h (not ntddk.h) so this header composes with driver.c, which includes
+// ntifs.h; including both would redefine PEPROCESS/PETHREAD.
+#include <ntifs.h>
 
 // Kernel headers use the NT typedefs, not the C99 ones. Provide the 64-bit
 // scalar names our code uses so the translation unit stays readable.

@@ -1,4 +1,4 @@
-﻿//=============================================================================
+//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -21,11 +21,10 @@
 //    - The device object is only created after an authenticated attach, and
 //      the driver object is marked non-unloadable from user mode.
 //=============================================================================
-#include "ntddk.h"
-// ntifs.h provides the kernel-only declarations this driver relies on:
-// IoCreateDeviceSecure, PsGetNextProcess and PsGetDirectoryTableBase. They are
-// absent from ntddk.h but their imports are exported by ntoskrnl.exe on every
-// supported build. wdmsec.h provides the SID/security types used below.
+// ntifs.h supersedes ntddk.h for kernel drivers and declares
+// PsGetNextProcess / PsGetDirectoryTableBase / IoCreateDeviceSecure. Including
+// both headers redefines PEPROCESS and PETHREAD, so only ntifs.h is used here.
+// wdmsec.h provides the SID and security-descriptor types.
 #include <ntifs.h>
 #include <wdmsec.h>
 #include "ntstatus.h"     // STATUS_DEVICE_STATE_ERROR and friends
@@ -66,25 +65,13 @@ typedef UINT64 uint64_t;
 #define DOMAIN_ALIAS_RID_ADMINS      0x00000220UL
 #endif
 
-// SID_IDENTIFIER_AUTHORITY is also declared in ntioapi.h, which the WDK does
-// not ship as a km header. Its layout has been stable since NT: six big-endian
-// bytes. Declared under a local name so a kit that does expose the SDK type
-// cannot collide with it.
-typedef struct _CODM_SID_IDENTIFIER_AUTHORITY {
-    UCHAR Value[6];
-} CODM_SID_IDENTIFIER_AUTHORITY;
-#define SID_IDENTIFIER_AUTHORITY CODM_SID_IDENTIFIER_AUTHORITY
-
+// ntifs.h/wdmsec.h already declare SID_IDENTIFIER_AUTHORITY, PSID and
+// SECURITY_MAX_SID_SIZE, so none of those are redefined here. Only the RID
+// value constants are supplied when the kit headers omit them.
 #define SECURITY_NT_AUTHORITY_BUILD   5
 #define SECURITY_MAX_SID_SIZE_BUILD  68
 
-// SID layout, needed to hand-build the Administrators DACL.
-typedef struct _CODM_SID {
-    UCHAR                     Revision;
-    UCHAR                     SubAuthorityCount;
-    SID_IDENTIFIER_AUTHORITY  IdentifierAuthority;
-    ULONG                     SubAuthority[1];
-} CODM_SID, *PCODM_SID;
+
 
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
 // Resolved dynamically so a build that lacks the export degrades to a clean
@@ -596,6 +583,7 @@ void XteaEncrypt(uint8_t* buf, SIZE_T words) {
         v[1] = v1;
     }
 }
+
 
 
 
