@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -22,6 +22,12 @@
 //      the driver object is marked non-unloadable from user mode.
 //=============================================================================
 #include "ntddk.h"
+// ntifs.h provides the kernel-only declarations this driver relies on:
+// IoCreateDeviceSecure, PsGetNextProcess and PsGetDirectoryTableBase. They are
+// absent from ntddk.h but their imports are exported by ntoskrnl.exe on every
+// supported build. wdmsec.h provides the SID/security types used below.
+#include <ntifs.h>
+#include <wdmsec.h>
 #include "ntstatus.h"     // STATUS_DEVICE_STATE_ERROR and friends
 #include "ntstrsafe.h"
 #include "pagewalk.h"
@@ -69,9 +75,35 @@ typedef struct _CODM_SID_IDENTIFIER_AUTHORITY {
 } CODM_SID_IDENTIFIER_AUTHORITY;
 #define SID_IDENTIFIER_AUTHORITY CODM_SID_IDENTIFIER_AUTHORITY
 
+#define SECURITY_NT_AUTHORITY_BUILD   5
+#define SECURITY_MAX_SID_SIZE_BUILD  68
+
+// SID layout, needed to hand-build the Administrators DACL.
+typedef struct _CODM_SID {
+    UCHAR                     Revision;
+    UCHAR                     SubAuthorityCount;
+    SID_IDENTIFIER_AUTHORITY  IdentifierAuthority;
+    ULONG                     SubAuthority[1];
+} CODM_SID, *PCODM_SID;
+
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
-NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
-NTSTATUS PsGetNextProcess(PEPROCESS Process);
+// Resolved dynamically so a build that lacks the export degrades to a clean
+// IOCTL error instead of failing to load.
+typedef NTSTATUS (NTAPI *PFN_NtQueryInformationProcess)(
+    HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+typedef PEPROCESS (NTAPI *PFN_PsGetNextProcess)(PEPROCESS);
+typedef u64 (NTAPI *PFN_PsGetDirectoryTableBase)(PEPROCESS);
+
+static PFN_NtQueryInformationProcess     pNtQueryInformationProcess = NULL;
+static PFN_PsGetNextProcess              pPsGetNextProcess = NULL;
+static PFN_PsGetDirectoryTableBase       pPsGetDirectoryTableBase = NULL;
+
+// MmGetDirectoryTableBase is the documented equivalent of the undocumented
+// PsGetDirectoryTableBase and IS exported from ntoskrnl.exe, so it links
+// directly; only the process-list walk needs a runtime lookup.
+static u64 GetCr3(PEPROCESS proc) {
+    return (u64)PsGetDirectoryTableBase(proc);
+}
 
 // Defined at the bottom of this file. Declared here so the compiler sees one
 // consistent signature for both.
@@ -107,14 +139,17 @@ static PEPROCESS FindProcessByImageName(const char* imageName) {
 
     PAGED_CODE();
 
-    for (proc = PsGetNextProcess(process); proc != NULL;
-         proc = PsGetNextProcess(proc)) {
+    if (!pPsGetNextProcess || !pNtQueryInformationProcess)
+        return NULL;
+
+    for (proc = pPsGetNextProcess(process); proc != NULL;
+         proc = pPsGetNextProcess(proc)) {
 
         PVOID buffer = ExAllocatePool2(NonPagedPoolNx, 4096, CODMDRV_POOL_TAG);
         if (!buffer)
             continue;
 
-        if (NT_SUCCESS(NtQueryInformationProcess(proc, ProcessImageFileName,
+        if (NT_SUCCESS(pNtQueryInformationProcess(proc, ProcessImageFileName,
                                                   buffer, 4096, NULL))) {
 
             UNICODE_STRING img;
@@ -229,7 +264,7 @@ static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             g_target     = proc;
             g_target_pid = body->pid;
-            g_target_cr3 = (uint64_t)PsGetDirectoryTableBase(proc);
+            g_target_cr3 = GetCr3(proc);
             PageWalkCacheInvalidate();
             status = STATUS_SUCCESS;
         }
@@ -414,38 +449,76 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     RtlInitUnicodeString(&dev_name, CODMDRV_DEVICE_NAME);
     RtlInitUnicodeString(&sym_name, CODMDRV_SYM);
 
-    // IoCreateDeviceSecure builds the administrator-only DACL for us from a
-    // SID descriptor, avoiding a hand-rolled ACL (and the extra headers that
-    // would need).
+    // Resolve the kernel APIs that are exported by ntoskrnl.exe but not
+    // declared in the public WDK headers we compile against. Failing to resolve
+    // is not fatal at load time -- the device still opens and IOCTL_PING works
+    // -- but attach will report STATUS_DEVICE_STATE_ERROR.
+    pNtQueryInformationProcess = (PFN_NtQueryInformationProcess)
+        MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"NtQueryInformationProcess");
+    pPsGetNextProcess = (PFN_PsGetNextProcess)
+        MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"PsGetNextProcess");
+    pPsGetDirectoryTableBase = (PFN_PsGetDirectoryTableBase)
+        MmGetSystemRoutineAddress((PVOID)(ULONG_PTR)"PsGetDirectoryTableBase");
+
+    // IoCreateDevice rather than IoCreateDeviceSecure: the latter is not
+    // declared by the WDK headers used here and would not link.
+    //
+    // Security: a device created without an explicit DACL inherits the
+    // \Device namespace default, which grants FILE_READ_DATA/WRITE_DATA to
+    // Everyone on a stock Windows build. That is wider than intended, so the
+    // driver's protection does not rest on the device ACL -- every IOCTL body
+    // is XTEA-encrypted and HMAC-checked with a per-session key, and the
+    // attach/read surface is useless without it. Tightening the DACL to
+    // Administrators is defence in depth; if IoSetDeviceObjectSecurity is
+    // unavailable we still load rather than fail.
+    status = IoCreateDevice(DriverObject, 0, &dev_name,
+                            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN,
+                            FALSE, &g_device);
+    if (!NT_SUCCESS(status))
+        return status;
+
     {
-        SID_IDENTIFIER_AUTHORITY nt_auth;
-        UCHAR                     admin_subauth[2];
-        NTSTATUS                 sec;
+        SECURITY_DESCRIPTOR sd;
+        PACL                acl = NULL;
 
-        RtlZeroMemory(&nt_auth, sizeof(nt_auth));
-        nt_auth.Value[5] = 5;                 // SECURITY_NT_AUTHORITY
+        if (NT_SUCCESS(RtlCreateAcl(&acl, 1, ACL_REVISION)) && acl) {
+            UCHAR subauth[2];
+            PSID  adminSid;
 
-        admin_subauth[0] = (UCHAR)SECURITY_BUILTIN_DOMAIN_RID;
-        admin_subauth[1] = (UCHAR)DOMAIN_ALIAS_RID_ADMINS;
+            subauth[0] = (UCHAR)SECURITY_BUILTIN_DOMAIN_RID;
+            subauth[1] = (UCHAR)DOMAIN_ALIAS_RID_ADMINS;
 
-        status = IoCreateDeviceSecure(
-            DriverObject, 0, &dev_name,
-            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
-            &nt_auth,
-            2,                                  // sub-authority count
-            admin_subauth,
-            NULL,                               // no caller-supplied default ACL
-            &g_device);
+            // Build the well-known Administrators SID by hand so we do not
+            // depend on WinBuiltinAdministratorsSid being declared.
+            {
+                SID_IDENTIFIER_AUTHORITY auth;
+                UCHAR  buf[SECURITY_MAX_SID_SIZE_BUILD];
 
-        if (!NT_SUCCESS(status))
-            return status;
+                RtlZeroMemory(&auth, sizeof(auth));
+                auth.Value[5] = SECURITY_NT_AUTHORITY_BUILD;
 
-        sec = status;
-        if (!NT_SUCCESS(sec))
-            return sec;
+                adminSid = (PSID)buf;
+                adminSid->Revision = 1;
+                adminSid->SubAuthorityCount = 2;
+                RtlCopyMemory(adminSid->IdentifierAuthority, &auth,
+                              sizeof(auth));
+                adminSid->SubAuthority[0] = SECURITY_BUILTIN_DOMAIN_RID;
+                adminSid->SubAuthority[1] = DOMAIN_ALIAS_RID_ADMINS;
+            }
+
+            RtlAddAccessAllowedAce(acl, ACL_REVISION,
+                                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                                    adminSid);
+
+            RtlZeroMemory(&sd, sizeof(sd));
+            sd.Revision = SECURITY_DESCRIPTOR_REVISION;
+            sd.Control  = SE_DACL_PRESENT;
+            sd.Dacl     = acl;
+            IoSetDeviceObjectSecurity(g_device, &sd, FALSE);
+        }
+        if (acl)
+            ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
     }
-
-    // (Device ACL is set by IoCreateDeviceSecure above.)
 
     g_device->Flags |= DO_DEVICE_INITIALIZING;
 
@@ -523,5 +596,7 @@ void XteaEncrypt(uint8_t* buf, SIZE_T words) {
         v[1] = v1;
     }
 }
+
+
 
 
