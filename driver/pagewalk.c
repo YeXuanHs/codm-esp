@@ -11,6 +11,11 @@
 //=============================================================================
 #include "pagewalk.h"
 
+// Defined near the bottom of this file; declared here because PteLookup (the
+// first function in the translation unit) needs them.
+BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size);
+BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size);
+
 //-----------------------------------------------------------------------------
 // CR3 cache for decoded page-table pages, so a 64-entity read does not
 // re-walk the same intermediate tables 64 times.
@@ -70,22 +75,17 @@ static u64 PteLookup(PTE_CACHE* cache, u64 cr3, u64 va,
         }
 
         if (page_phys == 0) {
-            PHYSICAL_ADDR pa;
-
             // MmGetPhysicalAddress resolves against the CURRENT process's
-            // address space, which is exactly what we want here: the page
-            // tables we are walking are mapped in our own context too.
+            // address space, which is what we want: the page tables we walk
+            // are mapped in our own context too.
             table_phys = MmGetPhysicalAddress((PVOID)next_entry_va).QuadPart;
             if (!table_phys)
                 return 0;
 
-            pa.QuadPart = table_phys + offset * 8;
-            if (!MmCopyMemory(&pte, sizeof(pte), (MM_COPY_ADDRESS)pa, sizeof(pte), MmNonCached))
+            if (!MmCopyFromPhys(table_phys + offset * 8, &pte, sizeof(pte)))
                 return 0;
         } else {
-            PHYSICAL_ADDR pa;
-            pa.QuadPart = page_phys + offset * 8;
-            if (!MmCopyMemory(&pte, sizeof(pte), (MM_COPY_ADDRESS)pa, sizeof(pte), MmNonCached))
+            if (!MmCopyFromPhys(page_phys + offset * 8, &pte, sizeof(pte)))
                 return 0;
         }
 
@@ -174,7 +174,6 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
         const u64 page_off = cur_va & 0xFFFULL;
         u32       chunk    = (u32)(0x1000ULL - page_off);
         u64       phys     = 0;
-        PHYSICAL_ADDR  pa;
 
         if (chunk > size - done)
             chunk = size - done;
@@ -182,8 +181,10 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
         if (!PteLookup(&g_pte_cache, cr3, cur_va, 0, &phys, NULL))
             return FALSE;
 
-        pa.QuadPart = phys;
-        if (!MmCopyMemory(dst + done, chunk, (MM_COPY_ADDRESS)pa, chunk, MmNonCached))
+        // MmCopyFromPhys applies the in-page offset itself, so hand it the
+        // chunk length starting at `phys`, and copy into our buffer at the
+        // position matching this chunk's start.
+        if (!MmCopyFromPhys(phys, dst + done, chunk))
             return FALSE;
 
         done += chunk;
@@ -206,7 +207,6 @@ BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
         const u64 page_off = cur_va & 0xFFFULL;
         u32       chunk    = (u32)(0x1000ULL - page_off);
         u64       phys     = 0;
-        PHYSICAL_ADDR  pa;
 
         if (chunk > size - done)
             chunk = size - done;
@@ -214,13 +214,57 @@ BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
         if (!PteLookup(&g_pte_cache, cr3, cur_va, 1, &phys, NULL))
             return FALSE;
 
-        pa.QuadPart = phys;
-        if (!MmCopyMemory((void*)(src + done), chunk, (MM_COPY_ADDRESS)pa, chunk, MmNonCached))
+        if (!MmCopyToPhys(phys, src + done, chunk))
             return FALSE;
 
         done += chunk;
     }
 
+    return TRUE;
+}
+
+//-----------------------------------------------------------------------------
+// Physical <-> virtual page helpers built on the documented MmMapIoSpace /
+// MmUnmapIoSpace pair.
+//
+// Mapping is done per page and immediately unmapped. That is slightly more work
+// than holding one mapping for the whole transfer, but it keeps the kernel
+// address space footprint flat and avoids holding a mapping to a page that
+// could be freed underneath us if the target exits mid-read.
+//-----------------------------------------------------------------------------
+BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size) {
+    PHYSICAL_ADDR pa;
+    PVOID         va;
+    BOOLEAN       ok;
+
+    if (!dst || size == 0)
+        return FALSE;
+
+    pa.QuadPart = phys & ~0xFFFULL;
+    va = MmMapIoSpace(pa, (SIZE_T)size, MmNonCached);
+    if (!va)
+        return FALSE;
+
+    RtlCopyMemory(dst, (PVOID)((u8*)va + (phys & 0xFFFULL)), size);
+    MmUnmapIoSpace(va, (SIZE_T)size);
+    ok = TRUE;
+    return ok;
+}
+
+BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size) {
+    PHYSICAL_ADDR pa;
+    PVOID         va;
+
+    if (!src || size == 0)
+        return FALSE;
+
+    pa.QuadPart = phys & ~0xFFFULL;
+    va = MmMapIoSpace(pa, (SIZE_T)size, MmWriteCombined);
+    if (!va)
+        return FALSE;
+
+    RtlCopyMemory((PVOID)((u8*)va + (phys & 0xFFFULL)), src, size);
+    MmUnmapIoSpace(va, (SIZE_T)size);
     return TRUE;
 }
 

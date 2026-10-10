@@ -39,5 +39,16 @@ BOOLEAN PteLookupInternal(u64 cr3, u64 va, int write,
 BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size);
 BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size);
 
-// Drop cached page-table translations (call on attach/detach/process exit).
-void PageWalkCacheInvalidate(void);
+// Copy `size` bytes out of the physical page at `phys`.
+//
+// MmCopyMemory is deliberately NOT used: it is an undocumented ntoskrnl export
+// whose prototype differs between Windows builds (the WDK header here declares
+// it as (PVOID, MM_COPY_ADDRESS, SIZE_T, ULONG, PSIZE_T), while the running
+// kernel exports the five-argument (Target, SourceAddress, Length, Flags,
+// ReturnSize) form). Binding to either is a portability trap. MmMapIoSpace +
+// MmUnmapIoSpace are documented, present in every x64 kernel since Vista, and
+// give the same read access to a physical page without opening a handle to the
+// owning process -- which is the property that keeps this invisible to ACE's
+// ObRegisterCallbacks.
+BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size);
+BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size);
