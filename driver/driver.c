@@ -1,4 +1,4 @@
-﻿//=============================================================================
+//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -15,11 +15,19 @@
 //                                attach on explicit IOCTL.
 //    3. FltRegisterFilter (minifilter) -> watches files. We write nothing.
 //
-//  Additional hardening applied here:
-//    - DriverEntry clears our own image from PsLoadedModuleList so a
-//      user-mode \\SystemRoot\\System32\\drivers enumeration cannot find us.
-//    - The device object is only created after an authenticated attach, and
-//      the driver object is marked non-unloadable from user mode.
+//  Additional posture applied here:
+//    - The driver is strictly read-only: there is no write path in the module
+//      at all. Physical addresses produced by the page-table walk are
+//      range-checked before being mapped, so a stale CR3 yields an IOCTL error
+//      rather than a bugcheck.
+//    - Every physical address produced by the page-table walk is range-checked
+//      before it is mapped, so a stale CR3 yields an IOCTL error rather than a
+//      bugcheck.
+//    - The IRP dispatch path runs at PASSIVE_LEVEL only and refuses anything
+//      higher instead of faulting.
+//    - The device carries an Administrators-only DACL, and every IOCTL body is
+//      XTEA-encrypted and HMAC-checked with a monotonically increasing
+//      sequence number, so merely opening \\.\CodeMmDrv is not enough.
 //=============================================================================
 // ntifs.h supersedes ntddk.h for kernel drivers and declares
 // PsGetNextProcess / PsGetDirectoryTableBase / IoCreateDeviceSecure. Including
@@ -132,7 +140,12 @@ static PEPROCESS FindProcessByImageName(const char* imageName) {
     PEPROCESS process = PsGetCurrentProcess();
     PEPROCESS proc;
 
-    PAGED_CODE();
+    // Not PAGED_CODE(): that macro asserts PASSIVE_LEVEL and bugchecks if the
+    // assertion is false. A driver that refuses bad input should return an
+    // error instead of taking the machine down, so the IRQL is checked and a
+    // status is handed back.
+    if (KeGetCurrentIrql() > APC_LEVEL)
+        return NULL;
 
     if (!pPsGetNextProcess || !pNtQueryInformationProcess)
         return NULL;
@@ -225,7 +238,16 @@ static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
     sys_buf = Irp->AssociatedIrp.SystemBuffer;
 
-    PAGED_CODE();
+    // Refuse anything above APC_LEVEL rather than asserting with PAGED_CODE().
+    // An IOCTL arriving at DISPATCH_LEVEL is a caller bug; answering
+    // STATUS_INVALID_DEVICE_STATE keeps the machine alive and makes the fault
+    // visible in the driver's IOCTL return code.
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_STATE;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
 
     if (in_len < sizeof(CODM_IOCTL_HEADER)) {
         status = STATUS_BUFFER_TOO_SMALL;
@@ -253,13 +275,26 @@ static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
         {
             PEPROCESS proc = FindProcessByImageName("CODM.exe");
+            u64       cr3;
+
             if (!proc) {
                 status = STATUS_NOT_FOUND;
                 break;
             }
+
+            cr3 = GetCr3(proc);
+            if (cr3 == 0) {
+                // The target is exiting or its address space is being torn
+                // down. Refusing here means every later read fails cleanly
+                // instead of walking a half-dead page table.
+                ObDereferenceObject(proc);
+                status = STATUS_DEVICE_STATE_ERROR;
+                break;
+            }
+
             g_target     = proc;
             g_target_pid = body->pid;
-            g_target_cr3 = GetCr3(proc);
+            g_target_cr3 = cr3;
             PageWalkCacheInvalidate();
             status = STATUS_SUCCESS;
         }
@@ -354,80 +389,21 @@ static NTSTATUS codm_close(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 //-----------------------------------------------------------------------------
-// Remove our entry from PsLoadedModuleList so that a user-mode walk of the
-// loaded-driver list does not show codmdrv.
+// Module-list hiding: intentionally NOT implemented.
 //
-// We locate our own LDR_DATA_TABLE_ENTRY by BaseDllName rather than reading
-// DriverObject->Section: the latter is not declared by the modern WDK and the
-// PE loader is the only component that may legally touch it. PsLoadedModuleList
-// is a documented-enough structure for a self-unlink, and the entry stays
-// resident because nothing releases a reference on our behalf.
+// An earlier revision unlinked this driver's LDR entry from
+// PsLoadedModuleList, casting the list head to PKSPIN_LOCK and driving it
+// with InterlockedCompareExchange / `*lock = 0`. That is unsafe on modern
+// Windows: the head of PsLoadedModuleList is not a bare LONG spinlock, and
+// writing zero into it can release a lock the kernel still owns, corrupting
+// loader state and bugchecking the machine.
 //
-// The list is protected by a spinlock that the kernel owns; acquiring it via
-// the exported ExAcquirePushbackLock on PsLoadedModuleLock keeps the edit
-// atomic against concurrent enumeration.
+// The hiding bought very little -- ACE does not enumerate third-party drivers
+// through this list to make its detection decisions -- while carrying a real
+// risk of an unrecoverable-looking crash. It is dropped rather than repaired.
+// The driver is still loaded from a normal path and is visible to any tool that
+// looks, which is the honest state of affairs.
 //-----------------------------------------------------------------------------
-typedef struct _LDR_DATA_TABLE_ENTRY_SHIM {
-    LIST_ENTRY              InLoadOrderLinks;
-    LIST_ENTRY              InMemoryOrderLinks;
-    LIST_ENTRY              InInitializationOrderLinks;
-    PVOID                   DllBase;
-    PVOID                   EntryPoint;
-    ULONG                   SizeOfImage;
-    UNICODE_STRING          FullDllName;
-    UNICODE_STRING          BaseDllName;
-    PVOID                   LoadLock;
-    ULONG                   Flags;
-    USHORT                  LoadCount;
-    USHORT                  TlsIndex;
-    PVOID                   HashLinks;
-    ULONG                   TimeDateStamp;
-    struct _LDR_DATA_TABLE_ENTRY_SHIM* SnapNext;
-} LDR_DATA_TABLE_ENTRY_SHIM, *PLDR_DATA_TABLE_ENTRY_SHIM;
-
-extern PLIST_ENTRY PsLoadedModuleList;
-
-static void UnlinkFromModuleList(PDRIVER_OBJECT DriverObject) {
-    const UNICODE_STRING target = RTL_CONSTANT_STRING(L"codmdrv.sys");
-    PLIST_ENTRY          link;
-    LARGE_INTEGER         start_tick;
-    LARGE_INTEGER         now;
-    const LONG            spin = 1;
-    PKSPIN_LOCK          lock = (PKSPIN_LOCK)&PsLoadedModuleList;
-
-    // Brief spinlock to walk the list safely.
-    start_tick = KeQueryPerformanceCounter(&start_tick);
-    for (;;) {
-        if (InterlockedCompareExchange((volatile LONG*)lock, spin, 0) == 0)
-            break;
-        now = KeQueryPerformanceCounter(&now);
-        if (now.QuadPart - start_tick.QuadPart > 1000000)
-            return;         // contended: leave the list alone
-        _mm_pause();
-    }
-
-    for (link = PsLoadedModuleList->Flink;
-         link != PsLoadedModuleList;
-         link = link->Flink) {
-
-        PLDR_DATA_TABLE_ENTRY_SHIM e =
-            (PLDR_DATA_TABLE_ENTRY_SHIM)CONTAINING_RECORD(link, LDR_DATA_TABLE_ENTRY_SHIM,
-                                                          InLoadOrderLinks);
-
-        if (e->BaseDllName.Buffer && e->BaseDllName.Length == target.Length &&
-            RtlCompareUnicodeString(&e->BaseDllName, &target, TRUE) == 0) {
-
-            if (link->Flink) link->Flink->Blink = link->Blink;
-            if (link->Blink) link->Blink->Flink = link->Flink;
-            // Self-link so the entry is not freed while we hold a raw pointer.
-            link->Flink = link;
-            link->Blink = link;
-            break;
-        }
-    }
-
-    *lock = 0;
-}
 
 #pragma alloc_text(INIT)
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -517,8 +493,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     g_device->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    // Go dark.
-    UnlinkFromModuleList(DriverObject);
 
     return STATUS_SUCCESS;
 }
@@ -587,6 +561,7 @@ void XteaEncrypt(uint8_t* buf, SIZE_T words) {
         v[1] = v1;
     }
 }
+
 
 
 

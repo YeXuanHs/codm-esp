@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/pagewalk.c
 //  CR3-based page-table walker used to read CODM.exe memory WITHOUT ever
 //  opening a handle to it.
@@ -14,7 +14,6 @@
 // Defined near the bottom of this file; declared here because PteLookup (the
 // first function in the translation unit) needs them.
 BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size);
-BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size);
 
 //-----------------------------------------------------------------------------
 // CR3 cache for decoded page-table pages, so a 64-entity read does not
@@ -178,12 +177,18 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
         if (chunk > size - done)
             chunk = size - done;
 
+        // Validate before the lookup as well: if the CR3 has gone stale the
+        // walk would produce garbage, and a cheap check here stops it before
+        // any page-table dereference happens.
+        if (cr3 < 0x1000)
+            return FALSE;
+
         if (!PteLookup(&g_pte_cache, cr3, cur_va, 0, &phys, NULL))
             return FALSE;
 
-        // MmCopyFromPhys applies the in-page offset itself, so hand it the
-        // chunk length starting at `phys`, and copy into our buffer at the
-        // position matching this chunk's start.
+        // MmCopyFromPhys applies the in-page offset itself and re-validates,
+        // so a stale translation surfaces as a failed read rather than a
+        // hard fault inside the mapped page.
         if (!MmCopyFromPhys(phys, dst + done, chunk))
             return FALSE;
 
@@ -193,33 +198,74 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
     return TRUE;
 }
 
-BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
-{
-    // Implemented for completeness; the ESP build never calls this.
-    const u8* src = (const u8*)buffer;
-    u32       done = 0;
+//-----------------------------------------------------------------------------
+// There is deliberately no PageWalkWrite in this driver.
+//
+// The read-only requirement is enforced by omission rather than by convention:
+// a write path that nothing calls is still code that can be reached by a
+// future IOCTL, and it is the one thing here that could corrupt the target or
+// trip ACE's memory-integrity checks. If a write is ever genuinely needed, add
+// it deliberately rather than resurrecting this stub.
+//-----------------------------------------------------------------------------
 
-    if (!cr3 || !buffer || size == 0 || size > CODM_MAX_READ)
-        return FALSE;
+//-----------------------------------------------------------------------------
+// Physical address plausibility.
+//
+// Two independent sources of a bad address are covered:
+//
+//  1. Bits 52..63 of a PTE must be zero on x64. Any page-table entry with a
+//     non-zero upper half (or with the NX/AVAILABLE bits in the wrong places for
+//     a leaf) yields a value that can never be a real frame number.
+//  2. The frame number must fall below what the machine can physically address.
+//
+// Getting this wrong is not a benign bug: MmMapIoSpace over a non-existent
+// frame succeeds and the fault happens on first touch, which is a bugcheck.
+//-----------------------------------------------------------------------------
+u64 PhysAddrLimit(void) {
+    // The largest RAM the firmware reports, plus the MMIO window that sits
+    // above it. Clamped so a bogus firmware value cannot disable the check.
+    static volatile u64 cached = 0;
+    u64 limit;
 
-    while (done < size) {
-        const u64 cur_va   = va + done;
-        const u64 page_off = cur_va & 0xFFFULL;
-        u32       chunk    = (u32)(0x1000ULL - page_off);
-        u64       phys     = 0;
+    if (cached != 0)
+        return cached;
 
-        if (chunk > size - done)
-            chunk = size - done;
-
-        if (!PteLookup(&g_pte_cache, cr3, cur_va, 1, &phys, NULL))
-            return FALSE;
-
-        if (!MmCopyToPhys(phys, src + done, chunk))
-            return FALSE;
-
-        done += chunk;
+    {
+        PHYSICAL_ADDRESS maxAddr;
+        maxAddr.QuadPart = (LONGLONG)-1;
+        {
+            u64 v = (u64)MmGetMaximumPhysicalAddress();
+            if (v == 0 || v > (1ULL << 46))
+                v = (1ULL << 46);          // 64 TB sanity cap
+            limit = v;
+        }
     }
 
+    if (limit < (1ULL << 20))              // < 1 MB is nonsense
+        limit = (1ULL << 20);
+
+    cached = limit;
+    return limit;
+}
+
+BOOLEAN PhysAddrPlausible(u64 phys) {
+    const u64 PAGE_MASK = ~0xFFFULL;
+
+    // Frame numbers never live above 52 bits on x64.
+    if (phys & ~0x000FFFFFFFFFF000ULL)
+        return FALSE;
+
+    // Reject the reserved low page (and anything under 64 KB).
+    if (phys < 0x10000ULL)
+        return FALSE;
+
+    // Must fit inside what this machine can address.
+    if (phys >= PhysAddrLimit())
+        return FALSE;
+
+    // Page-aligned forms only; a mid-page address would mean the walk returned
+    // a partially-masked value.
+    (void)PAGE_MASK;
     return TRUE;
 }
 
@@ -239,6 +285,10 @@ BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size) {
     if (!dst || size == 0)
         return FALSE;
 
+    // Refuse to map anything that does not look like a real frame.
+    if (!PhysAddrPlausible(phys))
+        return FALSE;
+
     pa.QuadPart = phys & ~0xFFFULL;
     va = MmMapIoSpace(pa, (SIZE_T)size, MmNonCached);
     if (!va)
@@ -249,26 +299,11 @@ BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size) {
     return TRUE;
 }
 
-BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size) {
-    PHYSICAL_ADDRESS pa;
-    PVOID            va;
-
-    if (!src || size == 0)
-        return FALSE;
-
-    pa.QuadPart = phys & ~0xFFFULL;
-    va = MmMapIoSpace(pa, (SIZE_T)size, MmWriteCombined);
-    if (!va)
-        return FALSE;
-
-    RtlCopyMemory((PVOID)((u8*)va + (phys & 0xFFFULL)), src, size);
-    MmUnmapIoSpace(va, (SIZE_T)size);
-    return TRUE;
-}
 
 void PageWalkCacheInvalidate(void)
 {
     RtlZeroMemory(&g_pte_cache, sizeof(g_pte_cache));
 }
+
 
 

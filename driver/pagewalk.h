@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/pagewalk.h
 //=============================================================================
 #pragma once
@@ -39,7 +39,6 @@ BOOLEAN PteLookupInternal(u64 cr3, u64 va, int write,
 
 // Read/write up to CODM_MAX_READ bytes in the target process by CR3 walk.
 BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size);
-BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size);
 
 // Copy `size` bytes out of the physical page at `phys`.
 //
@@ -53,4 +52,24 @@ BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size);
 // owning process -- which is the property that keeps this invisible to ACE's
 // ObRegisterCallbacks.
 BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size);
-BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size);
+
+//-----------------------------------------------------------------------------
+// Physical address sanity bounds.
+//
+// A stale CR3 (target exited, address space torn down between our two reads)
+// makes the page-table walk produce values that look like addresses but point
+// nowhere. Mapping such a page with MmMapIoSpace and then touching it raises a
+// hard page-fault that bugchecks the machine. Every physical address this
+// module produces is checked against these bounds first, and a failure is
+// reported as an IOCTL error.
+//
+// The lower bound rejects the small reserved addresses; the upper bound is
+// derived from the maximum physical address the machine reports, which keeps a
+// 16 GB host from ever accepting a value that only a much larger box could
+// have produced.
+//-----------------------------------------------------------------------------
+BOOLEAN PhysAddrPlausible(u64 phys);
+
+// Returns the highest valid physical address + 1 on this machine.
+u64    PhysAddrLimit(void);
+
