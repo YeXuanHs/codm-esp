@@ -1,4 +1,4 @@
-﻿//=============================================================================
+//=============================================================================
 //  driver/driver.c
 //
 //  codmdrv.sys -- CR3 page-table reader for CODM.exe
@@ -59,6 +59,15 @@ typedef UINT64 uint64_t;
 #ifndef DOMAIN_ALIAS_RID_ADMINS
 #define DOMAIN_ALIAS_RID_ADMINS      0x00000220UL
 #endif
+
+// SID_IDENTIFIER_AUTHORITY is also declared in ntioapi.h, which the WDK does
+// not ship as a km header. Its layout has been stable since NT: six big-endian
+// bytes. Declared under a local name so a kit that does expose the SDK type
+// cannot collide with it.
+typedef struct _CODM_SID_IDENTIFIER_AUTHORITY {
+    UCHAR Value[6];
+} CODM_SID_IDENTIFIER_AUTHORITY;
+#define SID_IDENTIFIER_AUTHORITY CODM_SID_IDENTIFIER_AUTHORITY
 
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
 NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);

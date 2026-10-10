@@ -162,6 +162,11 @@ jobs:
           Write-Host "=== compiling ==="
           # One source file per invocation: /Fo must name a single object when
           # multiple sources are given.
+          #
+          # ntioapi.h (PHYSICAL_ADDR, MM_COPY_ADDRESS, SID_IDENTIFIER_AUTHORITY)
+          # is NOT part of the public WDK surface; the driver declares those
+          # layouts locally instead. Listing the available headers on failure
+          # keeps that assumption checkable.
           foreach ($src in @('driver\driver.c', 'driver\pagewalk.c')) {
             $obj = Join-Path $PWD ("out\" + [IO.Path]::GetFileNameWithoutExtension($src) + '.obj')
             $oneRsp = Join-Path $PWD ("out\" + [IO.Path]::GetFileNameWithoutExtension($src) + '.rsp')
@@ -170,7 +175,12 @@ jobs:
               "/I`"$kmDir`"", "/I`"$sharedDir`"", "/Fo`"$obj`"") |
                 Set-Content -Path $oneRsp -Encoding ascii
             & cl.exe "@$oneRsp" $src
-            if ($LASTEXITCODE -ne 0) { throw "cl failed on $src : $LASTEXITCODE" }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "--- km headers present ---"
+              Get-ChildItem $kmDir -Filter '*.h' | Select-Object -First 40 |
+                  ForEach-Object { Write-Host "  $($_.Name)" }
+              throw "cl failed on $src : $LASTEXITCODE"
+            }
           }
 
           Write-Host "=== linking ==="
