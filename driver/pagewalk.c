@@ -1,4 +1,4 @@
-//=============================================================================
+﻿//=============================================================================
 //  driver/pagewalk.c
 //  CR3-based page-table walker used to read CODM.exe memory WITHOUT ever
 //  opening a handle to it.
@@ -16,14 +16,14 @@
 // re-walk the same intermediate tables 64 times.
 //-----------------------------------------------------------------------------
 typedef struct _PTE_CACHE_ENTRY {
-    uint64_t page_start;      // canonical VA the table page covers
-    uint64_t page_phys;       // physical address of the table page
-    uint64_t map_key;         // target CR3 at time of insert (revalidated)
+    u64 page_start;      // canonical VA the table page covers
+    u64 page_phys;       // physical address of the table page
+    u64 map_key;         // target CR3 at time of insert (revalidated)
 } PTE_CACHE_ENTRY;
 
 typedef struct _PTE_CACHE {
     PTE_CACHE_ENTRY slots[PTE_CACHE_SLOTS];
-    uint64_t        cr3;
+    u64        cr3;
 } PTE_CACHE;
 
 static PTE_CACHE g_pte_cache;
@@ -33,22 +33,22 @@ static PTE_CACHE g_pte_cache;
 // Returns 0 on failure. `write` is supported for completeness but the ESP
 // path is read-only by design.
 //-----------------------------------------------------------------------------
-static uint64_t PteLookup(PTE_CACHE* cache, uint64_t cr3, uint64_t va,
-                          int write, uint64_t* out_phys, uint32_t* out_flags)
+static u64 PteLookup(PTE_CACHE* cache, u64 cr3, u64 va,
+                          int write, u64* out_phys, u32* out_flags)
 {
     const int level_count = ADDRESS_SPACE_LEVELS;      // 4 on x64
-    uint64_t table[level_count];
+    u64 table[level_count];
     int      recurse_level;
 
     table[level_count - 1] = cr3 & ~0xFFFULL;
 
     for (recurse_level = level_count - 1; recurse_level >= 0; recurse_level--) {
-        uint64_t offset;
-        uint64_t page_phys;
-        uint64_t table_phys;
-        uint64_t next_phys;
-        uint64_t next_entry_va;
-        uint32_t pte;
+        u64 offset;
+        u64 page_phys;
+        u64 table_phys;
+        u64 next_phys;
+        u64 next_entry_va;
+        u32 pte;
         int      has_large_page;
 
         offset = (va >> (12 + recurse_level * 9)) & 511;
@@ -57,8 +57,8 @@ static uint64_t PteLookup(PTE_CACHE* cache, uint64_t cr3, uint64_t va,
         // Cache hit?
         page_phys = 0;
         {
-            const uint64_t bucket = (next_entry_va & ~0xFFFULL);
-            for (uint32_t i = 0; i < PTE_CACHE_SLOTS; i++) {
+            const u64 bucket = (next_entry_va & ~0xFFFULL);
+            for (u32 i = 0; i < PTE_CACHE_SLOTS; i++) {
                 if (cache->slots[i].map_key == cr3 &&
                     cache->slots[i].page_start == bucket) {
                     page_phys = cache->slots[i].page_phys;
@@ -105,7 +105,7 @@ static uint64_t PteLookup(PTE_CACHE* cache, uint64_t cr3, uint64_t va,
 
         if (has_large_page) {
             // 2MB or 1GB page. Base is aligned to the large-page size.
-            const uint64_t large_mask = (recurse_level == 2) ? 0x1FFFFFULL : 0x3FFFFFFFFFFULL;
+            const u64 large_mask = (recurse_level == 2) ? 0x1FFFFFULL : 0x3FFFFFFFFFFULL;
             const int user        = (pte & 0x04) != 0;
             const int writable    = (pte & 0x02) != 0;
             const int present     = (pte & 0x01) != 0;
@@ -126,9 +126,9 @@ static uint64_t PteLookup(PTE_CACHE* cache, uint64_t cr3, uint64_t va,
 
         // Insert into cache.
         {
-            const uint64_t bucket = (next_entry_va & ~0xFFFULL);
-            uint32_t victim = 0;
-            for (uint32_t i = 0; i < PTE_CACHE_SLOTS; i++) {
+            const u64 bucket = (next_entry_va & ~0xFFFULL);
+            u32 victim = 0;
+            for (u32 i = 0; i < PTE_CACHE_SLOTS; i++) {
                 if (cache->slots[i].map_key == cr3 &&
                     cache->slots[i].page_start == bucket) {
                     goto cached;
@@ -153,19 +153,19 @@ cached:;
 // `size` must be <= CODM_MAX_READ. Copies out through MmCopyVirtualMemory-like
 // physical reads so no target handle is required.
 //-----------------------------------------------------------------------------
-BOOLEAN PageWalkRead(uint64_t cr3, uint64_t va, void* buffer, uint32_t size)
+BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
 {
-    uint8_t*    dst = (uint8_t*)buffer;
-    uint32_t    done = 0;
+    u8*    dst = (u8*)buffer;
+    u32    done = 0;
 
     if (!cr3 || !buffer || size == 0 || size > CODM_MAX_READ)
         return FALSE;
 
     while (done < size) {
-        const uint64_t cur_va   = va + done;
-        const uint64_t page_off = cur_va & 0xFFFULL;
-        uint32_t       chunk    = (uint32_t)(0x1000ULL - page_off);
-        uint64_t       phys     = 0;
+        const u64 cur_va   = va + done;
+        const u64 page_off = cur_va & 0xFFFULL;
+        u32       chunk    = (u32)(0x1000ULL - page_off);
+        u64       phys     = 0;
         PHYSICAL_ADDR  pa;
 
         if (chunk > size - done)
@@ -184,20 +184,20 @@ BOOLEAN PageWalkRead(uint64_t cr3, uint64_t va, void* buffer, uint32_t size)
     return TRUE;
 }
 
-BOOLEAN PageWalkWrite(uint64_t cr3, uint64_t va, const void* buffer, uint32_t size)
+BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
 {
     // Implemented for completeness; the ESP build never calls this.
-    const uint8_t* src = (const uint8_t*)buffer;
-    uint32_t       done = 0;
+    const u8* src = (const u8*)buffer;
+    u32       done = 0;
 
     if (!cr3 || !buffer || size == 0 || size > CODM_MAX_READ)
         return FALSE;
 
     while (done < size) {
-        const uint64_t cur_va   = va + done;
-        const uint64_t page_off = cur_va & 0xFFFULL;
-        uint32_t       chunk    = (uint32_t)(0x1000ULL - page_off);
-        uint64_t       phys     = 0;
+        const u64 cur_va   = va + done;
+        const u64 page_off = cur_va & 0xFFFULL;
+        u32       chunk    = (u32)(0x1000ULL - page_off);
+        u64       phys     = 0;
         PHYSICAL_ADDR  pa;
 
         if (chunk > size - done)
@@ -220,3 +220,4 @@ void PageWalkCacheInvalidate(void)
 {
     RtlZeroMemory(&g_pte_cache, sizeof(g_pte_cache));
 }
+

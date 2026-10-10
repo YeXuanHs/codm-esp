@@ -14,9 +14,28 @@
 //=============================================================================
 #pragma once
 
+// This header is shared by the kernel driver and user mode, so it must not pull
+// in the CRT. Under /kernel the CRT's <stdint.h> is unavailable, so the
+// fixed-width scalar names are derived from the NT base types instead. User
+// mode gets the same definitions for free, which keeps both sides in sync.
+#ifdef _KERNEL_MODE
+#include <ntddk.h>
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <stdint.h>
+#endif
+
+#ifndef _STDINT_H_DEFINED_FOR_PROTO
+#define _STDINT_H_DEFINED_FOR_PROTO
+typedef UINT8  uint8_t;
+typedef UINT16 uint16_t;
+typedef UINT32 uint32_t;
+typedef UINT64 uint64_t;
+typedef INT8   int8_t;
+typedef INT16  int16_t;
+typedef INT32  int32_t;
+typedef INT64  int64_t;
+#endif
 
 //-----------------------------------------------------------------------------
 // Device / driver constants

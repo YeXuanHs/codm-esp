@@ -5,18 +5,25 @@
 
 #include <ntddk.h>
 
+// Kernel headers use the NT typedefs, not the C99 ones. Provide the 64-bit
+// scalar names our code uses so the translation unit stays readable.
+typedef UINT64  u64;
+typedef UINT32  u32;
+typedef UINT8   u8;
+typedef BOOLEAN bool_t;
+
 #define ADDRESS_SPACE_LEVELS  4
 #define PTE_CACHE_SLOTS        256
 #define CODM_MAX_READ          1024
 
 // Translate a VA in the process owning `cr3` to a physical address.
 // Returns TRUE on success and stores the physical address in `out_phys`.
-BOOLEAN PteLookupInternal(uint64_t cr3, uint64_t va, int write,
-                          uint64_t* out_phys, uint32_t* out_flags);
+BOOLEAN PteLookupInternal(u64 cr3, u64 va, int write,
+                          u64* out_phys, u32* out_flags);
 
 // Read/write up to CODM_MAX_READ bytes in the target process by CR3 walk.
-BOOLEAN PageWalkRead(uint64_t cr3, uint64_t va, void* buffer, uint32_t size);
-BOOLEAN PageWalkWrite(uint64_t cr3, uint64_t va, const void* buffer, uint32_t size);
+BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size);
+BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size);
 
 // Drop cached page-table translations (call on attach/detach/process exit).
 void PageWalkCacheInvalidate(void);
