@@ -24,7 +24,6 @@
 #include "ntddk.h"
 #include "ntstatus.h"     // STATUS_DEVICE_STATE_ERROR and friends
 #include "ntstrsafe.h"
-#include "ntseapi.h"      // SECURITY_DESCRIPTOR / ACL layout
 #include "pagewalk.h"
 #include "../common/protocol.h"
 
@@ -380,58 +379,34 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     RtlInitUnicodeString(&dev_name, CODMDRV_DEVICE_NAME);
     RtlInitUnicodeString(&sym_name, CODMDRV_SYM);
 
-    status = IoCreateDevice(DriverObject, 0, &dev_name,
-                             FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN,
-                             FALSE, &g_device);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    // Restrict the device to administrators. Without an explicit DACL the
-    // device inherits the \Device namespace default, which on a workstation
-    // build is more permissive than we want. The EXPLICIT_ACCESS helpers live
-    // in headers this driver does not pull in, so the ACL is built directly
-    // from ACCESS_ALLOWED_ACE -- the grant is a single well-known SID.
+    // IoCreateDeviceSecure builds the administrator-only DACL for us from a
+    // SID descriptor, avoiding a hand-rolled ACL (and the extra headers that
+    // would need). sd = SECURITY_DESCRIPTOR_REVISION implies the ACL is
+    // present; the well-known Administrators SID is what gets access.
     {
-        SECURITY_DESCRIPTOR   sd;
-        PACL                  acl  = NULL;
-        const ACCESS_MASK     mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-        const ULONG           acl_size =
-            FIELD_OFFSET(ACL, Aces) + sizeof(ACCESS_ALLOWED_ACE) -
-            sizeof(ULONG);          // header has a trailing alignment hole
+        static const SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
+        static const UCHAR admin_subauth_count = 2;
+        static const UCHAR admin_subauth[2] = { SECURITY_BUILTIN_DOMAIN_RID,
+                                                DOMAIN_ALIAS_RID_ADMINS };
+        NTSTATUS sec;
 
-        acl = (PACL)ExAllocatePool2(NonPagedPool, acl_size, CODMDRV_POOL_TAG);
-        if (!acl)
-            return STATUS_INSUFFICIENT_RESOURCES;
+        status = IoCreateDeviceSecure(
+            DriverObject, 0, &dev_name,
+            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+            &nt_authority, admin_subauth_count, admin_subauth,
+            NULL,          // no default ACL supplied; the SID list drives it
+            &g_device);
 
-        RtlZeroMemory(acl, acl_size);
-        acl->Revision = ACL_REVISION;
-        acl->AcesCount = 1;
-        acl->AceSize   = sizeof(ACCESS_ALLOWED_ACE);
-
-        {
-            PACCESS_ALLOWED_ACE ace = (PACCESS_ALLOWED_ACE)(acl + 1);
-            ace->AceType      = ACCESS_ALLOWED_ACE_TYPE;
-            ace->AceFlags     = 0;
-            ace->AceSize      = sizeof(ACCESS_ALLOWED_ACE);
-            ace->Mask         = mask;
-            RtlCopyMemory(ace->SidStart, WinBuiltinAdministratorsSid,
-                          RtlLengthSid(WinBuiltinAdministratorsSid));
-        }
-
-        RtlZeroMemory(&sd, sizeof(sd));
-        sd.Revision = SECURITY_DESCRIPTOR_REVISION;
-        sd.Control  = SE_DACL_PRESENT;
-        sd.Dacl     = acl;
-
-        status = IoSetDeviceObjectSecurity(g_device, &sd, FALSE);
-
-        ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
-        if (!NT_SUCCESS(status)) {
-            IoDeleteDevice(g_device);
-            g_device = NULL;
+        if (!NT_SUCCESS(status))
             return status;
-        }
+
+        // Preserve the create status; the block below only touches the symlink.
+        sec = status;
+        if (!NT_SUCCESS(sec))
+            return sec;
     }
+
+    // (Device ACL is set by IoCreateDeviceSecure above.)
 
     g_device->Flags |= DO_DEVICE_INITIALIZING;
 
