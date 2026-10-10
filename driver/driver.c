@@ -27,6 +27,18 @@
 #include "pagewalk.h"
 #include "../common/protocol.h"
 
+// ntstatus.h defines a subset; make sure the ones we raise are present even if
+// a future kit renames them.
+#ifndef STATUS_DEVICE_STATE_ERROR
+#define STATUS_DEVICE_STATE_ERROR  ((NTSTATUS)0xC0000184L)
+#endif
+#ifndef STATUS_PARTIAL_COPY
+#define STATUS_PARTIAL_COPY        ((NTSTATUS)0x80000002L)
+#endif
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES     ((NTSTATUS)0x8000001AL)
+#endif
+
 // Not declared by the WDK's public headers but exported by ntoskrnl.exe.
 NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 NTSTATUS PsGetNextProcess(PEPROCESS Process);
@@ -144,9 +156,8 @@ static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
     stack  = IoGetCurrentIrpStackLocation(Irp);
     // DeviceIoControl IRPs expose the request length under the IOCTL-specific
-    // union; InputBufferLength is the correct member (the old generic
-    // Parameters.Read.ReadLength is no longer declared by the WDK).
-    in_len = stack->Parameters.Ioctl.InputBufferLength;
+    // union member Parameters.DeviceIoControl.
+    in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
     sys_buf = Irp->AssociatedIrp.SystemBuffer;
 
     PAGED_CODE();
@@ -314,16 +325,19 @@ extern PLIST_ENTRY PsLoadedModuleList;
 static void UnlinkFromModuleList(PDRIVER_OBJECT DriverObject) {
     const UNICODE_STRING target = RTL_CONSTANT_STRING(L"codmdrv.sys");
     PLIST_ENTRY          link;
-    LARGE_INTEGER         tick;
+    LARGE_INTEGER         start_tick;
+    LARGE_INTEGER         now;
     const LONG            spin = 1;
     PKSPIN_LOCK          lock = (PKSPIN_LOCK)&PsLoadedModuleList;
 
-    // Brief spinlock to read the list safely.
-    tick.QuadPart = KeQueryPerformanceCounter(0);
-    while (InterlockedCompareExchange((volatile LONG*)lock, spin, 0) != 0) {
-        // Contended: back off rather than spin hot.
-        if (KeQueryPerformanceCounter(0) - tick.QuadPart > 1000000)
-            return;
+    // Brief spinlock to walk the list safely.
+    start_tick = KeQueryPerformanceCounter(&start_tick);
+    for (;;) {
+        if (InterlockedCompareExchange((volatile LONG*)lock, spin, 0) == 0)
+            break;
+        now = KeQueryPerformanceCounter(&now);
+        if (now.QuadPart - start_tick.QuadPart > 1000000)
+            return;         // contended: leave the list alone
         _mm_pause();
     }
 
@@ -371,26 +385,44 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (!NT_SUCCESS(status))
         return status;
 
-    // Administrators only.
+    // Restrict the device to administrators. Without an explicit DACL the
+    // device would inherit whatever the \Device namespace default is, which on
+    // a workstation build is more permissive than we want.
     {
         SECURITY_DESCRIPTOR sd;
-        PACL                  acl = NULL;
-        EXPLICIT_ACCESS       ea;
+        PACL                acl = NULL;
+        EXPLICIT_ACCESS     ea[1];
+        ULONG               ea_len = sizeof(ea);
 
-        RtlInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-        RtlSetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   // NULL DACL => default
-
-        ExAllocatePool2(NonPagedPool, 4 * sizeof(EXPLICIT_ACCESS),
-                        CODMDRV_POOL_TAG);
-        RtlZeroMemory(&ea, sizeof(ea));
+        RtlZeroMemory(ea, sizeof(ea));
         ea[0].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-        ea[0].grfAccessMode = GRANT_ACCESS;
-        ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-        ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-        ea[0].Trustee.TrusteeValue = WinBuiltinAdministratorsSid;
+        ea[0].grfAccessMode         = GRANT_ACCESS;
+        ea[0].Trustee.TrusteeForm   = TRUSTEE_IS_SID;
+        ea[0].Trustee.TrusteeType   = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea[0].Trustee.TrusteeValue  = WinBuiltinAdministratorsSid;
 
-        status = RtlSetSecurityDescriptorDacl(&sd, TRUE, &ea[0], 1);
-        UNREFERENCED_PARAMETER(acl);
+        status = RtlCreateAcl(&acl, 1, 2 /* ACL_REVISION */);
+        if (NT_SUCCESS(status)) {
+            status = RtlAddAccessAllowedAce(acl, 2, ea[0].grfAccessPermissions,
+                                            ea[0].Trustee.TrusteeValue);
+        }
+        if (NT_SUCCESS(status)) {
+            RtlInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+            status = RtlSetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE);
+        }
+        if (acl)
+            ExFreePoolWithTag(acl, CODMDRV_POOL_TAG);
+        if (!NT_SUCCESS(status)) {
+            IoDeleteDevice(g_device);
+            g_device = NULL;
+            return status;
+        }
+        status = IoSetDeviceObjectSecurity(g_device, &sd, FALSE);
+        if (!NT_SUCCESS(status)) {
+            IoDeleteDevice(g_device);
+            g_device = NULL;
+            return status;
+        }
     }
 
     g_device->Flags |= DO_DEVICE_INITIALIZING;
