@@ -1,4 +1,4 @@
-﻿//=============================================================================
+//=============================================================================
 //  driver/pagewalk.c
 //  CR3-based page-table walker used to read CODM.exe memory WITHOUT ever
 //  opening a handle to it.
@@ -36,13 +36,15 @@ static PTE_CACHE g_pte_cache;
 static u64 PteLookup(PTE_CACHE* cache, u64 cr3, u64 va,
                           int write, u64* out_phys, u32* out_flags)
 {
-    const int level_count = ADDRESS_SPACE_LEVELS;      // 4 on x64
-    u64 table[level_count];
-    int      recurse_level;
+    // x64 always has four levels. ADDRESS_SPACE_LEVELS is a macro so the array
+    // bound is a compile-time constant; a `const int` here would create a VLA,
+    // which kernel mode rejects.
+    u64 table[ADDRESS_SPACE_LEVELS];
+    int  recurse_level;
 
-    table[level_count - 1] = cr3 & ~0xFFFULL;
+    table[ADDRESS_SPACE_LEVELS - 1] = cr3 & ~0xFFFULL;
 
-    for (recurse_level = level_count - 1; recurse_level >= 0; recurse_level--) {
+    for (recurse_level = ADDRESS_SPACE_LEVELS - 1; recurse_level >= 0; recurse_level--) {
         u64 offset;
         u64 page_phys;
         u64 table_phys;
@@ -68,16 +70,22 @@ static u64 PteLookup(PTE_CACHE* cache, u64 cr3, u64 va,
         }
 
         if (page_phys == 0) {
+            PHYSICAL_ADDR pa;
+
+            // MmGetPhysicalAddress resolves against the CURRENT process's
+            // address space, which is exactly what we want here: the page
+            // tables we are walking are mapped in our own context too.
             table_phys = MmGetPhysicalAddress((PVOID)next_entry_va).QuadPart;
             if (!table_phys)
                 return 0;
-            // Read the entry itself from the previous-level table page.
-            PHYSICAL_ADDR pa = { .QuadPart = table_phys + offset * 8 };
-            if (!MmCopyMemory(&pte, sizeof(pte), pa, sizeof(pte), MmNonCached))
+
+            pa.QuadPart = table_phys + offset * 8;
+            if (!MmCopyMemory(&pte, sizeof(pte), (MM_COPY_ADDRESS)pa, sizeof(pte), MmNonCached))
                 return 0;
         } else {
-            PHYSICAL_ADDR pa = { .QuadPart = page_phys + offset * 8 };
-            if (!MmCopyMemory(&pte, sizeof(pte), pa, sizeof(pte), MmNonCached))
+            PHYSICAL_ADDR pa;
+            pa.QuadPart = page_phys + offset * 8;
+            if (!MmCopyMemory(&pte, sizeof(pte), (MM_COPY_ADDRESS)pa, sizeof(pte), MmNonCached))
                 return 0;
         }
 
@@ -175,7 +183,7 @@ BOOLEAN PageWalkRead(u64 cr3, u64 va, void* buffer, u32 size)
             return FALSE;
 
         pa.QuadPart = phys;
-        if (!MmCopyMemory(dst + done, chunk, pa, chunk, MmNonCached))
+        if (!MmCopyMemory(dst + done, chunk, (MM_COPY_ADDRESS)pa, chunk, MmNonCached))
             return FALSE;
 
         done += chunk;
@@ -207,7 +215,7 @@ BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
             return FALSE;
 
         pa.QuadPart = phys;
-        if (!MmCopyMemory((void*)(src + done), chunk, pa, chunk, MmNonCached))
+        if (!MmCopyMemory((void*)(src + done), chunk, (MM_COPY_ADDRESS)pa, chunk, MmNonCached))
             return FALSE;
 
         done += chunk;
@@ -220,4 +228,5 @@ void PageWalkCacheInvalidate(void)
 {
     RtlZeroMemory(&g_pte_cache, sizeof(g_pte_cache));
 }
+
 

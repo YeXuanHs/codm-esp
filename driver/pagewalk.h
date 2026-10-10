@@ -12,6 +12,17 @@ typedef UINT32  u32;
 typedef UINT8   u8;
 typedef BOOLEAN bool_t;
 
+// PHYSICAL_ADDR / MM_COPY_ADDRESS are declared in ntioapi.h, which this driver
+// does not include. Their layout is fixed and exported by ntoskrnl.exe:
+//   PHYSICAL_ADDR { LARGE_INTEGER QuadPart; }   -- MM_COPY_ADDRESS
+typedef struct _PHYSICAL_ADDR_LOCAL {
+    LARGE_INTEGER QuadPart;
+} PHYSICAL_ADDR_LOCAL, *PPHYSICAL_ADDR_LOCAL, MM_COPY_ADDRESS_LOCAL;
+
+// Use the SDK names when they happen to be visible, otherwise our local ones.
+typedef PHYSICAL_ADDR_LOCAL   PHYSICAL_ADDR;
+typedef MM_COPY_ADDRESS_LOCAL MM_COPY_ADDRESS;
+
 #define ADDRESS_SPACE_LEVELS  4
 #define PTE_CACHE_SLOTS        256
 #define CODM_MAX_READ          1024
