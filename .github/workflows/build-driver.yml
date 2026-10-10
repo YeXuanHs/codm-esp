@@ -141,26 +141,13 @@ jobs:
 
           Write-Host "=== c.rsp ==="; Get-Content $cflags | ForEach-Object { Write-Host "  $_" }
 
-          # Dump the predefined macros so a target-architecture failure is
+          # Compile the macro probe so a target-architecture failure is
           # diagnosable from the log without a second round trip.
           Write-Host "=== arch macro probe ==="
-          $probe = Join-Path $PWD 'out\probe.c'
-          @'
-#if defined(_AMD64_)
-#pragma message("ARCH _AMD64_ DEFINED")
-#else
-#pragma message("ARCH _AMD64_ NOT DEFINED")
-#endif
-#if defined(_KERNEL_MODE)
-#pragma message("KERNEL MODE DEFINED")
-#else
-#pragma message("KERNEL MODE NOT DEFINED")
-#endif
-#if defined(_WIN64)
-#pragma message("WIN64 DEFINED")
-#endif
-'@ | Set-Content -Path $probe -Encoding ascii
-          & cl.exe /nologo /c /W0 "/kernel" "/arch:x64" "/Fo`"$PWD\out\probe.obj`"" $probe 2>&1 |
+          $probeRsp = Join-Path $PWD 'out\probe.rsp'
+          @('/nologo', '/c', '/W0', '/kernel', '/arch:x64',
+            "/Fo`"$PWD\out\probe.obj`"") | Set-Content -Path $probeRsp -Encoding ascii
+          & cl.exe "@$probeRsp" driver\arch_probe.c 2>&1 |
               ForEach-Object { Write-Host "  probe: $_" }
 
           Write-Host "=== compiling ==="
