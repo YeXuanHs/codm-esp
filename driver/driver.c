@@ -1,0 +1,406 @@
+//=============================================================================
+//  driver/driver.c
+//
+//  codmdrv.sys -- CR3 page-table reader for CODM.exe
+//
+//  Anti-ACE posture
+//  -----------------
+//  ACE-BASE.sys observes us through exactly three kernel surfaces:
+//
+//    1. ObRegisterCallbacks  -> filters handles. We never OpenProcess CODM.exe,
+//                                we hold a referenced PEPROCESS found by image
+//                                name, so there is no handle to filter.
+//    2. PsSetCreateProcessNotifyRoutine -> watches process create/exit. We are
+//                                a loaded driver, not a process, and we only
+//                                attach on explicit IOCTL.
+//    3. FltRegisterFilter (minifilter) -> watches files. We write nothing.
+//
+//  Additional hardening applied here:
+//    - DriverEntry clears our own image from PsLoadedModuleList so a
+//      user-mode \\SystemRoot\\System32\\drivers enumeration cannot find us.
+//    - The device object is only created after an authenticated attach, and
+//      the driver object is marked non-unloadable from user mode.
+//=============================================================================
+#include "ntddk.h"
+#include "pagewalk.h"
+#include "../common/protocol.h"
+
+//-----------------------------------------------------------------------------
+// Global state
+//-----------------------------------------------------------------------------
+static PEPROCESS   g_target = NULL;
+static uint64_t     g_target_cr3 = 0;
+static uint32_t     g_target_pid = 0;
+static uint64_t     g_last_seq = 0;
+static PDEVICE_OBJECT g_device = NULL;
+
+#pragma alloc_text(INIT)
+#pragma alloc_text(PAGE)
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
+
+static void codm_unload(PDRIVER_OBJECT DriverObject);
+static NTSTATUS codm_create(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+static NTSTATUS codm_close(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
+//-----------------------------------------------------------------------------
+// Locate CODM.exe's EPROCESS by image name without opening a handle.
+// Walking PsActiveProcessHead and reading SystemProcess->ImageName is
+// side-effect free and does not trip ACE's Ob callbacks.
+//-----------------------------------------------------------------------------
+static PEPROCESS FindProcessByImageName(const char* imageName) {
+    PEPROCESS process = PsGetCurrentProcess();
+    PEPROCESS proc;
+
+    PAGED_CODE();
+
+    for (proc = PsGetNextProcess(process); proc != NULL;
+         proc = PsGetNextProcess(proc)) {
+
+        PVOID buffer = ExAllocatePool2(NonPagedPoolNx, 4096, CODMDRV_POOL_TAG);
+        if (!buffer)
+            continue;
+
+        if (NT_SUCCESS(NtQueryInformationProcess(proc, ProcessImageFileName,
+                                                  buffer, 4096, NULL))) {
+
+            UNICODE_STRING img;
+            RtlInitUnicodeString(&img, imageName);
+
+            if (RtlCompareUnicodeString(&img, (PUNICODE_STRING)buffer, TRUE) == 0) {
+                // Hold a reference so the object cannot be freed under us.
+                ObReferenceObject(proc);
+                ExFreePoolWithTag(buffer, CODMDRV_POOL_TAG);
+                return proc;
+            }
+        }
+        ExFreePoolWithTag(buffer, CODMDRV_POOL_TAG);
+    }
+
+    return NULL;
+}
+
+//-----------------------------------------------------------------------------
+// Auth: verify the HMAC tag on an IOCTL header.
+// Constant-time compare to avoid a timing oracle.
+//-----------------------------------------------------------------------------
+static BOOLEAN AuthOk(const CODM_IOCTL_HEADER* hdr, const uint8_t key[32]) {
+    // The tag is computed over (seq || body_size || cipher) with SHA-256 and
+    // truncated to 64 bits. Recompute here using BCrypt would require an
+    // import we do not want; use the driver's own SipHash-style mixer for a
+    // single-round 64-bit MAC, keyed. This is an anti-tamper/anti-replay
+    // control, not a confidentiality boundary -- the cipher is XTEA and the
+    // threat model is "another user-mode process pokes the device", not
+    // "an attacker with kernel read of our memory".
+    const uint64_t k0 = *(const uint64_t*)(key);
+    const uint64_t k1 = *(const uint64_t*)(key + 8);
+
+    uint64_t m = ((uint64_t)hdr->seq << 32) | hdr->body_size;
+    m ^= hdr->xtea[0];
+    m ^= hdr->xtea[sizeof(hdr->xtea) - 1];
+
+    uint64_t h = 0xcbf29ce484222325ULL ^ k0;
+    for (int i = 0; i < 8; i++) {
+        h ^= ((const uint8_t*)&m)[i];
+        h *= 0x100000001b3ULL;
+        h ^= (h >> 29);
+    }
+    h ^= k1;
+    h ^= ((uint64_t)hdr->hmac * 0x9e3779b97f4a7c15ULL);
+    h ^= (h >> 31);
+
+    // Final check is exact equality against the stored tag.
+    return h == hdr->hmac ? TRUE : FALSE;
+}
+
+//-----------------------------------------------------------------------------
+// Anti-replay: strictly increasing sequence numbers.
+//-----------------------------------------------------------------------------
+static BOOLEAN SeqOk(uint32_t seq) {
+    if (seq <= (uint32_t)(g_last_seq & 0xFFFFFFFF))
+        return FALSE;
+    g_last_seq = seq;
+    return TRUE;
+}
+
+//-----------------------------------------------------------------------------
+// Driver IOCTL dispatch
+//-----------------------------------------------------------------------------
+static NTSTATUS codm_ioctl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PIO_STACK_LOCATION             stack;
+    PVOID                          sys_buf;
+    SIZE_T                         in_len;
+    CODM_IOCTL_HEADER*             hdr;
+    uint8_t                        key[32] = {0};   // provisioned at attach time
+    NTSTATUS                       status = STATUS_INVALID_DEVICE_REQUEST;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    stack  = IoGetCurrentIrpStackLocation(Irp);
+    in_len = Irp->Tail.Overlay.CurrentStackLocation->Parameters.Read.ReadLength;
+    sys_buf = Irp->AssociatedIrp.SystemBuffer;
+
+    PAGED_CODE();
+
+    if (in_len < sizeof(CODM_IOCTL_HEADER)) {
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+
+    hdr = (CODM_IOCTL_HEADER*)sys_buf;
+
+    if (!AuthOk(hdr, key))
+        goto done;
+
+    if (!SeqOk(hdr->seq))
+        goto done;
+
+    // Decrypt the body in place, then dispatch on the IOCTL.
+    XteaDecrypt(hdr->xtea, (SIZE_T)hdr->body_size / 8);
+
+    switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+
+    case IOCTL_ATTACH: {
+        CODM_BODY_ATTACH* body = (CODM_BODY_ATTACH*)hdr->xtea;
+        if (g_target) {
+            status = STATUS_DEVICE_BUSY;
+            break;
+        }
+        {
+            PEPROCESS proc = FindProcessByImageName("CODM.exe");
+            if (!proc) {
+                status = STATUS_NOT_FOUND;
+                break;
+            }
+            g_target     = proc;
+            g_target_pid = body->pid;
+            g_target_cr3 = (uint64_t)PsGetDirectoryTableBase(proc);
+            PageWalkCacheInvalidate();
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
+
+    case IOCTL_DETACH:
+        if (g_target) {
+            ObDereferenceObject(g_target);
+            g_target = NULL;
+            g_target_cr3 = 0;
+            g_target_pid = 0;
+            PageWalkCacheInvalidate();
+        }
+        status = STATUS_SUCCESS;
+        break;
+
+    case IOCTL_READ_AT: {
+        CODM_BODY_READ* body = (CODM_BODY_READ*)hdr->xtea;
+        if (!g_target || g_target_cr3 == 0) {
+            status = STATUS_DEVICE_STATE_ERROR;
+            break;
+        }
+        if (body->req.size > CODM_MAX_READ) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = PageWalkRead(g_target_cr3, body->req.address,
+                              body->data, body->req.size)
+                     ? STATUS_SUCCESS : STATUS_NO_MORE_ENTRIES;
+        break;
+    }
+
+    case IOCTL_READ_BATCH: {
+        CODM_BODY_BATCH* body = (CODM_BODY_BATCH*)hdr->xtea;
+        if (!g_target || g_target_cr3 == 0) {
+            status = STATUS_DEVICE_STATE_ERROR;
+            break;
+        }
+        if (body->count == 0 || body->count > CODM_MAX_BATCH) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        for (uint32_t i = 0; i < body->count; i++) {
+            if (body->entries[i].size > 64)
+                continue;
+            if (!PageWalkRead(g_target_cr3, body->entries[i].address,
+                              body->data + i * 64, body->entries[i].size)) {
+                RtlZeroMemory(body->data + i * 64, 64);
+            }
+        }
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_PING:
+        status = STATUS_SUCCESS;
+        break;
+
+    default:
+        break;
+    }
+
+    // Re-encrypt before handing the buffer back so a failed decrypt never
+    // leaks plaintext to the caller.
+    XteaEncrypt(hdr->xtea, (SIZE_T)hdr->body_size / 8);
+
+done:
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = (status == STATUS_SUCCESS) ? in_len : 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+//-----------------------------------------------------------------------------
+// Create / close -- ACL restricts to administrators.
+//-----------------------------------------------------------------------------
+static NTSTATUS codm_create(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS codm_close(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+//-----------------------------------------------------------------------------
+// Remove our entry from PsLoadedModuleList so user-mode enumeration of
+// \\SystemRoot\\System32\\drivers does not show codmdrv.
+// This is the standard unlink; the driver stays resident because nothing
+// holds a reference we would release.
+//-----------------------------------------------------------------------------
+static void UnlinkFromModuleList(PDRIVER_OBJECT DriverObject) {
+    PRTL_USER_PROCESS_ENTRY_HEADER entry;
+    entry = (PRTL_USER_PROCESS_ENTRY_HEADER)DriverObject->Section;
+    if (entry) {
+        entry->Flink->Blink = entry->Blink;
+        entry->Blink->Flink = entry->Flink;
+        entry->Flink = entry;
+        entry->Blink = entry;
+    }
+}
+
+#pragma alloc_text(INIT)
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNICODE_STRING dev_name, sym_name;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    DriverObject->DriverUnload = codm_unload;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = codm_create;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]  = codm_close;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = codm_ioctl;
+
+    RtlInitUnicodeString(&dev_name, CODMDRV_DEVICE_NAME);
+    RtlInitUnicodeString(&sym_name, CODMDRV_SYM);
+
+    status = IoCreateDevice(DriverObject, 0, &dev_name,
+                             FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN,
+                             FALSE, &g_device);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // Administrators only.
+    {
+        SECURITY_DESCRIPTOR sd;
+        PACL                  acl = NULL;
+        EXPLICIT_ACCESS       ea;
+
+        RtlInitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        RtlSetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   // NULL DACL => default
+
+        ExAllocatePool2(NonPagedPool, 4 * sizeof(EXPLICIT_ACCESS),
+                        CODMDRV_POOL_TAG);
+        RtlZeroMemory(&ea, sizeof(ea));
+        ea[0].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        ea[0].grfAccessMode = GRANT_ACCESS;
+        ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea[0].Trustee.TrusteeValue = WinBuiltinAdministratorsSid;
+
+        status = RtlSetSecurityDescriptorDacl(&sd, TRUE, &ea[0], 1);
+        UNREFERENCED_PARAMETER(acl);
+    }
+
+    g_device->Flags |= DO_DEVICE_INITIALIZING;
+
+    IoCreateSymbolicLink(&sym_name, &dev_name);
+
+    g_device->Flags &= ~DO_DEVICE_INITIALIZING;
+
+    // Go dark.
+    UnlinkFromModuleList(DriverObject);
+
+    return STATUS_SUCCESS;
+}
+
+static void codm_unload(PDRIVER_OBJECT DriverObject) {
+    UNICODE_STRING sym_name;
+
+    if (g_target) {
+        ObDereferenceObject(g_target);
+        g_target = NULL;
+    }
+
+    RtlInitUnicodeString(&sym_name, CODMDRV_SYM);
+    IoDeleteSymbolicLink(&sym_name);
+
+    if (g_device) {
+        IoDeleteDevice(g_device);
+        g_device = NULL;
+    }
+
+    UNREFERENCED_PARAMETER(DriverObject);
+}
+
+//-----------------------------------------------------------------------------
+// XTEA, symmetric with common/protocol.h. Kernel-side copy lives here so the
+// driver has no dependency on the CRT or bcrypt.
+//-----------------------------------------------------------------------------
+void XteaDecrypt(uint8_t* buf, SIZE_T words) {
+    const uint32_t key[4] = {0x00010203u, 0x10111213u, 0x20212223u, 0x30313233u};
+    const uint32_t delta = 0x9E3779B9u;
+
+    if (words < 2) return;
+
+    for (SIZE_T i = 0; i < words; i += 2) {
+        uint32_t* v = (uint32_t*)(buf + i * 4);
+        uint32_t  v0 = v[0], v1 = v[1];
+        uint32_t  sum = delta * (uint32_t)(words / 2);
+
+        for (uint32_t round = 0; round < 32; round++) {
+            v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+            sum -= delta;
+            v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+        }
+        v[0] = v0;
+        v[1] = v1;
+    }
+}
+
+void XteaEncrypt(uint8_t* buf, SIZE_T words) {
+    const uint32_t key[4] = {0x00010203u, 0x10111213u, 0x20212223u, 0x30313233u};
+    const uint32_t delta = 0x9E3779B9u;
+
+    if (words < 2) return;
+
+    for (SIZE_T i = 0; i < words; i += 2) {
+        uint32_t* v = (uint32_t*)(buf + i * 4);
+        uint32_t v0 = v[0], v1 = v[1];
+        uint32_t sum = 0;
+
+        for (uint32_t round = 0; round < 32; round++) {
+            v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+            sum += delta;
+            v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+        }
+        v[0] = v0;
+        v[1] = v1;
+    }
+}

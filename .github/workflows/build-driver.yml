@@ -1,0 +1,93 @@
+#=============================================================================
+#  .github/workflows/build-driver.yml
+#
+#  Builds codmdrv.sys with the Windows Driver Kit on a GitHub-hosted windows
+#  runner, then uploads the signed-universal PE as a build artifact.
+#
+#  Why CI: the development host runs Win11 build 28000, which the WDK's
+#  installer rejects ("当前 OS 版本不在支持的版本范围"), so ntddk.h and
+#  ntoskrnl.lib are unavailable locally. The runner images ship a supported
+#  SDK, and the resulting .sys is a plain PE that loads on 28000 -- a driver
+#  binary is not bound to the build of the machine that compiled it.
+#
+#  Nothing proprietary is uploaded: this repository holds only our own source.
+#=============================================================================
+name: build-driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'driver/**'
+      - 'common/**'
+      - '.github/workflows/build-driver.yml'
+
+jobs:
+  build:
+    name: WDK x64 release
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wdk = 'C:\Program Files (x86)\Windows Kits\10\Include'
+          if (-not (Test-Path $wdk)) {
+            Write-Host "WDK include dir missing, installing..."
+            $installer = "$env:RUNNER_TEMP\wdksetup.exe"
+            Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2289980' `
+                              -OutFile $installer -UseBasicParsing
+            & $installer /install /quiet /norestart `
+                /features +vdmfxs +wdf +corewr +netwfx +wdf11 +wdf10 `
+                           +kmdf +fltmgr +hidclass +ndis +netcfg `
+                           +windowsdriverkitfull +debugtools
+            if ($LASTEXITCODE -ne 0) { throw "WDK install failed: $LASTEXITCODE" }
+          }
+          Get-ChildItem $wdk | Select-Object -ExpandProperty Name
+
+      - name: Locate WDK kit version
+        id: kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' `
+                 -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $inc) { throw 'no Windows Kit include directory' }
+          if (-not (Test-Path (Join-Path $inc.FullName 'km\ntddk.h'))) {
+            throw "km\ntddk.h not present in $($inc.FullName) -- WDK kernel headers missing"
+          }
+          "version=$($inc.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "using kit $($inc.Name)"
+
+      - name: Build driver
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          cd /d "%GITHUB_WORKSPACE%"
+          if not exist out mkdir out
+          cl /nologo /c /W0 /GS- /Gs- /guard:cf- ^
+             /kernel /GS- ^
+             /I "C:\Program Files (x86)\Windows Kits\10\Include\%KIT_VERSION%\km" ^
+             /I "C:\Program Files (x86)\Windows Kits\10\Include\%KIT_VERSION%\shared" ^
+             /Foout\ driver\driver.c driver\pagewalk.c
+          if errorlevel 1 exit /b 1
+          link /nologo /driver /subsystem:native /entry:DriverEntry ^
+                /machine:x64 /out:out\codmdrv.sys ^
+                /libpath:"C:\Program Files (x86)\Windows Kits\10\Lib\%KIT_VERSION%\km\x64" ^
+                /libpath:"C:\Program Files (x86)\Windows Kits\10\Lib\%KIT_VERSION%\shared" ^
+                out\driver.obj out\pagewalk.obj ntoskrnl.lib hal.lib
+          if errorlevel 1 exit /b 1
+          dir out\codmdrv.sys
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codmdrv-sys
+          path: out/codmdrv.sys
+          if-no-files-found: error

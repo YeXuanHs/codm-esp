@@ -1,0 +1,15 @@
+# Build output
+out/
+*.obj
+*.sys
+*.pdb
+*.exe
+
+# Local artifacts from runtime probing (contain dumped process memory --
+# never commit these)
+*.bin
+dumper/out/
+
+# Editor noise
+.vs/
+*.user
