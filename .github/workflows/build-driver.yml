@@ -28,6 +28,10 @@ jobs:
     name: WDK x64 release
     runs-on: windows-2022
 
+    env:
+      # Single source of truth for the kit version; every later step reads this.
+      WDK_KIT: '10.0.26100.0'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,23 +59,36 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $root = 'C:\Program Files (x86)\Windows Kits\10\Include'
-          # Only version-numbered directories are kit versions; there are also
-          # non-version siblings such as 'wdf', which must be excluded.
-          $cands = Get-ChildItem $root -Directory |
-                   Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-                   Sort-Object { [version]$_.Name } -Descending
-          $kit = $null
-          foreach ($c in $cands) {
-            if (Test-Path (Join-Path $c.FullName 'km\ntddk.h')) { $kit = $c; break }
+          $root = 'C:\Program Files (x86)\Windows Kits\10'
+          # Prefer the pinned kit, but fall back to whatever WDK the runner
+          # image actually provides (the image version can move).
+          $wanted = $env:WDK_KIT
+          $incRoot = Join-Path $root 'Include'
+          $libRoot = Join-Path $root 'Lib'
+
+          $kitName = $null
+          $ordered = @($wanted) + @(
+              Get-ChildItem $incRoot -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending |
+              ForEach-Object { $_.Name })
+
+          foreach ($k in $ordered) {
+            if (-not $k) { continue }
+            $hasHdr = Test-Path (Join-Path $incRoot "$k\km\ntddk.h")
+            $hasLib = Test-Path (Join-Path $libRoot "$k\km\x64\ntoskrnl.lib")
+            Write-Host "candidate $k : headers=$hasHdr libs=$hasLib"
+            if ($hasHdr -and $hasLib) { $kitName = $k; break }
           }
-          if (-not $kit) {
+          if (-not $kitName) {
             Write-Host "available include dirs:"
-            Get-ChildItem $root -Directory | ForEach-Object { Write-Host "  $($_.Name)" }
-            throw 'no kit directory containing km\ntddk.h -- WDK kernel headers missing'
+            Get-ChildItem $incRoot -Directory | ForEach-Object { Write-Host "  $($_.Name)" }
+            throw 'no kit directory with both km\ntddk.h and km\x64\ntoskrnl.lib'
           }
-          "version=$($kit.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "using kit $($kit.Name)"
+
+          "version=$kitName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Add-Content -Path $env:GITHUB_ENV -Value "KIT_VERSION=$kitName"
+          Write-Host "using kit $kitName"
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -79,27 +96,46 @@ jobs:
           arch: x64
 
       - name: Build driver
-        shell: cmd
+        shell: pwsh
         run: |
-          set KIT=%KIT_VERSION%
-          if not exist "C:\Program Files (x86)\Windows Kits\10\Lib\%KIT%\km\x64\ntoskrnl.lib" (
-            echo ERROR: ntoskrnl.lib missing for kit %KIT%
-            dir "C:\Program Files (x86)\Windows Kits\10\Lib\%KIT%"
-            exit /b 1
-          )
-          cd /d "%GITHUB_WORKSPACE%"
-          if not exist out mkdir out
-          cl /nologo /c /W0 /GS- /Gs- /guard:cf- ^
-             /I "C:\Program Files (x86)\Windows Kits\10\Include\%KIT%\km" ^
-             /I "C:\Program Files (x86)\Windows Kits\10\Include\%KIT%\shared" ^
-             /Foout\ driver\driver.c driver\pagewalk.c
-          if errorlevel 1 exit /b 1
-          link /nologo /driver /subsystem:native /entry:DriverEntry ^
-                /machine:x64 /out:out\codmdrv.sys ^
-                /libpath:"C:\Program Files (x86)\Windows Kits\10\Lib\%KIT%\km\x64" ^
-                out\driver.obj out\pagewalk.obj ntoskrnl.lib hal.lib
-          if errorlevel 1 exit /b 1
-          dir out\codmdrv.sys
+          $ErrorActionPreference = 'Stop'
+          $kit = $env:KIT_VERSION
+          if (-not $kit) { throw 'KIT_VERSION not set' }
+          $kitsRoot = 'C:\Program Files (x86)\Windows Kits\10'
+
+          $ntoskrnl = Join-Path $kitsRoot "Lib\$kit\km\x64\ntoskrnl.lib"
+          $hal      = Join-Path $kitsRoot "Lib\$kit\km\x64\hal.lib"
+          foreach ($lib in @($ntoskrnl, $hal)) {
+            if (-not (Test-Path $lib)) {
+              Write-Host "missing: $lib"
+              Get-ChildItem (Split-Path $lib) | ForEach-Object { Write-Host "  $($_.Name)" }
+              throw "import library missing: $lib"
+            }
+          }
+
+          $kmDir     = Join-Path $kitsRoot "Include\$kit\km"
+          $sharedDir = Join-Path $kitsRoot "Include\$kit\shared"
+          foreach ($inc in @($kmDir, $sharedDir)) {
+            if (-not (Test-Path $inc)) { throw "include dir missing: $inc" }
+          }
+
+          New-Item -ItemType Directory -Force -Path "$PWD\out" | Out-Null
+
+          Write-Host "=== compiling ==="
+          & cl.exe /nologo /c /W0 /GS- /Gs- /guard:cf- `
+                    "/I$kmDir" "/I$sharedDir" "/Fo$PWD\out\\" `
+                    driver\driver.c driver\pagewalk.c
+          if ($LASTEXITCODE -ne 0) { throw "cl failed: $LASTEXITCODE" }
+
+          Write-Host "=== linking ==="
+          & link.exe /nologo /driver /subsystem:native /entry:DriverEntry `
+                     /machine:x64 "/out:$PWD\out\codmdrv.sys" `
+                     "/libpath:$(Join-Path $kitsRoot "Lib\$kit\km\x64")" `
+                     "$PWD\out\driver.obj" "$PWD\out\pagewalk.obj" `
+                     ntoskrnl.lib hal.lib
+          if ($LASTEXITCODE -ne 0) { throw "link failed: $LASTEXITCODE" }
+
+          Get-Item "$PWD\out\codmdrv.sys" | Select-Object Name, Length
 
       - name: Upload driver artifact
         uses: actions/upload-artifact@v4
