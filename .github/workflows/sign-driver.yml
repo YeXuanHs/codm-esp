@@ -1,0 +1,142 @@
+#=============================================================================
+#  .github/workflows/sign-driver.yml
+#
+#  Signs codmdrv.sys with a freshly generated kernel-mode test certificate.
+#
+#  Why CI: the build host runs Win11 build 28000, where the driver must carry a
+#  signature whose chain terminates in a certificate Windows already trusts.
+#  Test-signing mode (bcdedit /set testsigning on) is enabled, but the trust
+#  anchor still has to be present. signtool on the host also rejects the PFX
+#  produced by New-SelfSignedCertificate for driver signing, so the whole
+#  certificate path is done here where the toolchain is clean.
+#
+#  The certificate is generated inside the job and thrown away with it. No key
+#  material is committed to the repository.
+#=============================================================================
+name: sign-driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'driver/**'
+      - 'common/**'
+      - '.github/workflows/sign-driver.yml'
+
+jobs:
+  sign:
+    name: sign codmdrv.sys
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Locate WDK and build unsigned driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitsRoot = 'C:\Program Files (x86)\Windows Kits\10'
+          $incRoot  = Join-Path $kitsRoot 'Include'
+          $libRoot  = Join-Path $kitsRoot 'Lib'
+
+          $kit = $null
+          foreach ($k in (Get-ChildItem $incRoot -Directory |
+                          Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+                          Sort-Object { [version]$_.Name } -Descending)) {
+            if ((Test-Path (Join-Path $incRoot "$($k.Name)\km\ntddk.h")) -and
+                (Test-Path (Join-Path $libRoot "$($k.Name)\km\x64\ntoskrnl.lib"))) {
+              $kit = $k.Name; break
+            }
+          }
+          if (-not $kit) { throw 'no usable WDK kit on this image' }
+          "KIT_VERSION=$kit" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "using kit $kit"
+
+          $km     = Join-Path $incRoot "$kit\km"
+          $shared = Join-Path $incRoot "$kit\shared"
+          $libkm  = Join-Path $libRoot "$kit\km\x64"
+
+          New-Item -ItemType Directory -Force -Path "$PWD\out" | Out-Null
+
+          foreach ($src in @('driver\driver.c', 'driver\pagewalk.c')) {
+            $stem = [IO.Path]::GetFileNameWithoutExtension($src)
+            $obj  = Join-Path $PWD "out\$stem.obj"
+            $rsp  = Join-Path $PWD "out\$stem.rsp"
+            @('/nologo', '/c', '/W0', '/kernel', '/GS-', '/Gs-', '/guard:cf-',
+              '/D_AMD64_', '/D_AMD64', '/D__x86_64__', '/D_WIN64',
+              "/I`"$km`"", "/I`"$shared`"", "/Fo`"$obj`"") |
+                Set-Content -Path $rsp -Encoding ascii
+            & cl.exe "@$rsp" $src
+            if ($LASTEXITCODE -ne 0) { throw "cl failed on $src" }
+          }
+
+          $lrsp = Join-Path $PWD 'out\link.rsp'
+          @('/nologo', '/driver', '/subsystem:native', '/entry:DriverEntry', '/machine:x64',
+            "/out:`"$PWD\out\codmdrv.sys`"", "/libpath:`"$libkm`"",
+            "`"$PWD\out\driver.obj`"", "`"$PWD\out\pagewalk.obj`"",
+            'ntoskrnl.lib', 'hal.lib') | Set-Content -Path $lrsp -Encoding ascii
+          & link.exe "@$lrsp"
+          if ($LASTEXITCODE -ne 0) { throw 'link failed' }
+
+      - name: Create kernel-mode test certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 1.3.6.1.4.1.311.61.1.1 is the Code Signing EKU for kernel-mode
+          # drivers. Without it signtool refuses the certificate.
+          $cert = New-SelfSignedCertificate `
+                    -Type CodeSigningCert `
+                    -Subject 'CN=CODMESP Kernel Test' `
+                    -CertStoreLocation 'Cert:\CurrentUser\My' `
+                    -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+                    -KeyUsage DigitalSignature `
+                    -NotAfter (Get-Date).AddYears(3) `
+                    -TextExtension @('2.5.29.37={text}1.3.6.1.4.1.311.61.1.1')
+
+          "CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Export as .cer (the trust anchor to install on the target machine)
+          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" `
+                              -FilePath "$PWD\out\codmesp-kernel.cer" -Type CERT | Out-Null
+
+          # Export as .pfx (the key signtool consumes)
+          $sec = ConvertTo-SecureString -String 'codm2026' -Force -AsPlainText
+          Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" `
+                                -FilePath "$PWD\out\codmesp-kernel.pfx" `
+                                -Password $sec | Out-Null
+          Get-ChildItem "$PWD\out" | Select-Object Name, Length
+
+      - name: Sign the driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $st = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse `
+                   -Filter 'signtool.exe' | Where-Object { $_.FullName -match '\\x64\\' } |
+                   Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $st) { throw 'signtool.exe not found' }
+          Write-Host "using $st"
+
+          & $st sign /v /fd SHA256 `
+                /f "$PWD\out\codmesp-kernel.pfx" /p 'codm2026' `
+                "$PWD\out\codmdrv.sys"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed: $LASTEXITCODE" }
+
+          Write-Host "=== signature verification ==="
+          & $st verify /v "$PWD\out\codmdrv.sys"
+          if ($LASTEXITCODE -ne 0) { throw 'signature did not verify' }
+
+      - name: Upload signed driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: codmdrv-signed
+          path: |
+            out/codmdrv.sys
+            out/codmesp-kernel.cer
+          if-no-files-found: error
