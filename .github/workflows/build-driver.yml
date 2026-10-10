@@ -122,12 +122,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$PWD\out" | Out-Null
 
           # Response files: PowerShell's native-argument handling can mangle
-          # MSVC-style /flags, and these are the flags that actually matter
-          # (/kernel for _KERNEL_MODE, /arch:x64 so ntdef.h sees _AMD64_).
+          # MSVC-style /flags.
+          #
+          # Note on the architecture macro: /arch:x64 is REJECTED in kernel
+          # mode ("ignoring unknown option"), which leaves _AMD64_ undefined
+          # and makes shared\ntdef.h raise "#error No Target Architecture".
+          # _WIN64 is already defined by /kernel, but ntdef.h's PROBE_ALIGNMENT
+          # branch keys specifically on _AMD64_, so we define it directly.
           $cflags = Join-Path $PWD 'out\c.rsp'
           @(
-            '/nologo', '/c', '/W0', '/kernel', '/arch:x64', '/GS-', '/Gs-', '/guard:cf-',
-            "/I`"$kmDir`"", "/I`"$sharedDir`"", "/Fo`"$PWD\out\`""
+            '/nologo', '/c', '/W0', '/kernel', '/GS-', '/Gs-', '/guard:cf-',
+            '/D_AMD64_', '/D_AMD64', '/D__x86_64__', '/D_WIN64',
+            "/I`"$kmDir`"", "/I`"$sharedDir`""
           ) | Set-Content -Path $cflags -Encoding ascii
 
           $ldflags = Join-Path $PWD 'out\l.rsp'
@@ -143,16 +149,29 @@ jobs:
 
           # Compile the macro probe so a target-architecture failure is
           # diagnosable from the log without a second round trip.
+          # /arch:x64 is not used here either; the probe asserts the same
+          # explicit /D_AMD64_ the real build uses.
           Write-Host "=== arch macro probe ==="
           $probeRsp = Join-Path $PWD 'out\probe.rsp'
-          @('/nologo', '/c', '/W0', '/kernel', '/arch:x64',
+          @('/nologo', '/c', '/W0', '/kernel', '/GS-', '/guard:cf-',
+            '/D_AMD64_', '/D_AMD64', '/D__x86_64__', '/D_WIN64',
             "/Fo`"$PWD\out\probe.obj`"") | Set-Content -Path $probeRsp -Encoding ascii
           & cl.exe "@$probeRsp" driver\arch_probe.c 2>&1 |
               ForEach-Object { Write-Host "  probe: $_" }
 
           Write-Host "=== compiling ==="
-          & cl.exe "@$cflags" driver\driver.c driver\pagewalk.c
-          if ($LASTEXITCODE -ne 0) { throw "cl failed: $LASTEXITCODE" }
+          # One source file per invocation: /Fo must name a single object when
+          # multiple sources are given.
+          foreach ($src in @('driver\driver.c', 'driver\pagewalk.c')) {
+            $obj = Join-Path $PWD ("out\" + [IO.Path]::GetFileNameWithoutExtension($src) + '.obj')
+            $oneRsp = Join-Path $PWD ("out\" + [IO.Path]::GetFileNameWithoutExtension($src) + '.rsp')
+            @('/nologo', '/c', '/W0', '/kernel', '/GS-', '/Gs-', '/guard:cf-',
+              '/D_AMD64_', '/D_AMD64', '/D__x86_64__', '/D_WIN64',
+              "/I`"$kmDir`"", "/I`"$sharedDir`"", "/Fo`"$obj`"") |
+                Set-Content -Path $oneRsp -Encoding ascii
+            & cl.exe "@$oneRsp" $src
+            if ($LASTEXITCODE -ne 0) { throw "cl failed on $src : $LASTEXITCODE" }
+          }
 
           Write-Host "=== linking ==="
           & link.exe "@$ldflags"
