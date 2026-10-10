@@ -469,33 +469,26 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         PACL                acl = NULL;
 
         if (NT_SUCCESS(RtlCreateAcl(&acl, 1, ACL_REVISION)) && acl) {
-            UCHAR subauth[2];
-            PSID  adminSid;
+            // PSID is an incomplete type in the WDK headers, so build the
+            // well-known Administrators SID through a local, fully-typed
+            // alias rather than dereferencing the opaque pointer.
+            struct {
+                UCHAR    Revision;
+                UCHAR    SubAuthorityCount;
+                UCHAR    IdentifierAuthority[6];
+                ULONG    SubAuthority[2];
+            } admin_sid;
 
-            subauth[0] = (UCHAR)SECURITY_BUILTIN_DOMAIN_RID;
-            subauth[1] = (UCHAR)DOMAIN_ALIAS_RID_ADMINS;
-
-            // Build the well-known Administrators SID by hand so we do not
-            // depend on WinBuiltinAdministratorsSid being declared.
-            {
-                SID_IDENTIFIER_AUTHORITY auth;
-                UCHAR  buf[SECURITY_MAX_SID_SIZE_BUILD];
-
-                RtlZeroMemory(&auth, sizeof(auth));
-                auth.Value[5] = SECURITY_NT_AUTHORITY_BUILD;
-
-                adminSid = (PSID)buf;
-                adminSid->Revision = 1;
-                adminSid->SubAuthorityCount = 2;
-                RtlCopyMemory(adminSid->IdentifierAuthority, &auth,
-                              sizeof(auth));
-                adminSid->SubAuthority[0] = SECURITY_BUILTIN_DOMAIN_RID;
-                adminSid->SubAuthority[1] = DOMAIN_ALIAS_RID_ADMINS;
-            }
+            RtlZeroMemory(&admin_sid, sizeof(admin_sid));
+            admin_sid.Revision            = 1;
+            admin_sid.SubAuthorityCount   = 2;
+            admin_sid.IdentifierAuthority[5] = SECURITY_NT_AUTHORITY_BUILD;
+            admin_sid.SubAuthority[0]     = SECURITY_BUILTIN_DOMAIN_RID;
+            admin_sid.SubAuthority[1]     = DOMAIN_ALIAS_RID_ADMINS;
 
             RtlAddAccessAllowedAce(acl, ACL_REVISION,
-                                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                                    adminSid);
+                                   FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                                   (PSID)&admin_sid);
 
             RtlZeroMemory(&sd, sizeof(sd));
             sd.Revision = SECURITY_DESCRIPTOR_REVISION;
