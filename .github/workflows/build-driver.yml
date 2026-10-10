@@ -122,9 +122,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$PWD\out" | Out-Null
 
           Write-Host "=== compiling ==="
-          # /kernel is required: it defines _KERNEL_MODE and the pool/tag APIs,
-          # and is what ntdef.h checks when it raises "No Target Architecture".
-          & cl.exe /nologo /c /W0 /kernel /GS- /Gs- /guard:cf- `
+          # /kernel sets _KERNEL_MODE; /arch:x64 sets _AMD64_. ntdef.h's
+          # PROBE_ALIGNMENT branch requires _AMD64_/_X86_/_ARM64EC_, and
+          # raises "#error No Target Architecture" when none is defined --
+          # in kernel mode MSVC does not define the arch macro implicitly.
+          & cl.exe /nologo /c /W0 /kernel /arch:x64 /GS- /Gs- /guard:cf- `
                     "/I$kmDir" "/I$sharedDir" "/Fo$PWD\out\\" `
                     driver\driver.c driver\pagewalk.c
           if ($LASTEXITCODE -ne 0) { throw "cl failed: $LASTEXITCODE" }
