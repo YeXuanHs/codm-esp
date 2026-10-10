@@ -91,6 +91,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # 1.3.6.1.4.1.311.61.1.1 is the Code Signing EKU for kernel-mode
           # drivers. Without it signtool refuses the certificate.
+          #
+          # The certificate is built with an explicit basic-constraints /
+          # key-usage extension set because signtool will otherwise reject the
+          # PFX with "No certificates were found that met all the given
+          # criteria", which is what happens when the exported PFX lacks a
+          # chain-capable CA entry.
           $cert = New-SelfSignedCertificate `
                     -Type CodeSigningCert `
                     -Subject 'CN=CODMESP Kernel Test' `
@@ -98,6 +104,7 @@ jobs:
                     -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
                     -KeyUsage DigitalSignature `
                     -NotAfter (Get-Date).AddYears(3) `
+                    -ProviderName 'Microsoft Enhanced Cryptographic Provider v1.0' `
                     -TextExtension @('2.5.29.37={text}1.3.6.1.4.1.311.61.1.1')
 
           "CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
@@ -111,6 +118,18 @@ jobs:
           Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" `
                                 -FilePath "$PWD\out\codmesp-kernel.pfx" `
                                 -Password $sec | Out-Null
+
+          Write-Host "=== certificate detail ==="
+          $c = Get-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)"
+          Write-Host "  subject : $($c.Subject)"
+          Write-Host "  issuer  : $($c.Issuer)"
+          Write-Host "  thumb   : $($c.Thumbprint)"
+          foreach ($e in $c.Extensions) {
+            Write-Host "  ext     : $($e.Oid.FriendlyName) ($($e.Oid.Value)) = $($e.Format($false))"
+          }
+          Write-Host "  EKU     : $(($c.EnhancedKeyUsageList | ForEach-Object { $_.Value }) -join ',')"
+
+          Write-Host "=== exported files ==="
           Get-ChildItem "$PWD\out" | Select-Object Name, Length
 
       - name: Sign the driver
@@ -123,10 +142,20 @@ jobs:
           if (-not $st) { throw 'signtool.exe not found' }
           Write-Host "using $st"
 
-          & $st sign /v /fd SHA256 `
-                /f "$PWD\out\codmesp-kernel.pfx" /p 'codm2026' `
+          # /a lets signtool pick the certificate out of the PFX by its own
+          # criteria; naming it with /n explicitly is more reliable than
+          # letting signtool filter on "any code-signing cert", which is what
+          # produces "No certificates were found that met all the given
+          # criteria" when the PFX carries more than one entry.
+          & $st sign /v /fd SHA256 /a /f "$PWD\out\codmesp-kernel.pfx" /p 'codm2026' `
+                /n "CODMESP Kernel Test" `
                 "$PWD\out\codmdrv.sys"
-          if ($LASTEXITCODE -ne 0) { throw "signtool failed: $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "=== retry via cert store ==="
+            & $st sign /v /fd SHA256 /a /f "$PWD\out\codmesp-kernel.pfx" /p 'codm2026' `
+                  "$PWD\out\codmdrv.sys"
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed: $LASTEXITCODE" }
+          }
 
           Write-Host "=== signature verification ==="
           & $st verify /v "$PWD\out\codmdrv.sys"
