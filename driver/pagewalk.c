@@ -233,9 +233,8 @@ BOOLEAN PageWalkWrite(u64 cr3, u64 va, const void* buffer, u32 size)
 // could be freed underneath us if the target exits mid-read.
 //-----------------------------------------------------------------------------
 BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size) {
-    PHYSICAL_ADDR pa;
-    PVOID         va;
-    BOOLEAN       ok;
+    PHYSICAL_ADDRESS pa;      // MmMapIoSpace takes PHYSICAL_ADDRESS
+    PVOID            va;
 
     if (!dst || size == 0)
         return FALSE;
@@ -247,13 +246,12 @@ BOOLEAN MmCopyFromPhys(u64 phys, void* dst, u32 size) {
 
     RtlCopyMemory(dst, (PVOID)((u8*)va + (phys & 0xFFFULL)), size);
     MmUnmapIoSpace(va, (SIZE_T)size);
-    ok = TRUE;
-    return ok;
+    return TRUE;
 }
 
 BOOLEAN MmCopyToPhys(u64 phys, const void* src, u32 size) {
-    PHYSICAL_ADDR pa;
-    PVOID         va;
+    PHYSICAL_ADDRESS pa;
+    PVOID            va;
 
     if (!src || size == 0)
         return FALSE;
