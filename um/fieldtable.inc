@@ -42,7 +42,12 @@ static int CmdFieldTable(KernelDriver& kd, DWORD pid, uint64_t classAddr,
             UINT64 cls, nptr;
             memcpy(&cls, buf.data() + o, 8);
             memcpy(&nptr, buf.data() + o + 16, 8);
-            bool ok = (cls == classAddr) && nptr >= strtab && nptr < strtab + strsz;
+            // Continuity must be decided by the class pointer alone: a few
+            // records (static/event fields) carry a name pointer outside the
+            // string table, and treating those as breaks chops a 361-entry
+            // table into fragments.
+            bool ok = (cls == classAddr);
+            (void)nptr;
             if (ok) {
                 if (!run) runStart = base + o;
                 ++run;
