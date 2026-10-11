@@ -1332,14 +1332,19 @@ int main(int argc, char** argv) {
         bool     useRef = false;
         float    refX = 0, refZ = 0, maxDist = 100.0f;
 
+        // Positional numbers are only the min/max range; once an option
+        // has been seen (and its value consumed) no further numbers belong
+        // to us - "--pid 2304" must not be read as a range bound.
+        bool seenOpt = false;
         for (int i = 4; i < argc; ++i) {
             std::string a = argv[i];
-            if (a == "--px" && i + 1 < argc)      { refX = (float)atof(argv[++i]); useRef = true; }
-            else if (a == "--pz" && i + 1 < argc) { refZ = (float)atof(argv[++i]); useRef = true; }
-            else if (a == "--maxdist" && i + 1 < argc) { maxDist = (float)atof(argv[++i]); }
-            else if (a.size() > 1 && a[0] == '-' && a[1] == '-') {
-                // some other option - not a number
-            } else if (a.size() && (isdigit((unsigned char)a[0]) || a[0] == '.')) {
+            if (a.size() > 1 && a[0] == '-' && a[1] == '-') {
+                seenOpt = true;
+                if (a == "--px" && i + 1 < argc)      { refX = (float)atof(argv[++i]); useRef = true; }
+                else if (a == "--pz" && i + 1 < argc) { refZ = (float)atof(argv[++i]); useRef = true; }
+                else if (a == "--maxdist" && i + 1 < argc) { maxDist = (float)atof(argv[++i]); }
+            } else if (!seenOpt && a.size() &&
+                       (isdigit((unsigned char)a[0]) || a[0] == '.')) {
                 float v = (float)atof(argv[i]);
                 if (v >= 100.0f) hi = v; else lo = v;
             }
