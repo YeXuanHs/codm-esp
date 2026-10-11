@@ -5,3 +5,13 @@ out/
 *.pdb
 *.exe
 *.log
+
+# 保留逆向关键产物
+!CODM_RE_NOTES.md
+!PI_FIELD_OFFSETS.json
+!pinames.txt
+!big.bin
+!out/
+!tools_re/live_sec*.bin
+!tools_re/CODM_live.exe
+!tools_re/*.py
