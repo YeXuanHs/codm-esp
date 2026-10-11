@@ -772,6 +772,91 @@ static int CmdDiffScan(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end
 }
 
 // ------------------------------------------------------------
+// findpos <start> <end> [minVal] [maxVal]
+//
+// Hunt for entity position triples. Every pawn in this build keeps its world
+// position as a float3 whose Y component is always 0 (top-down world space),
+// with X and Z inside the 9167-unit map. That signature is specific enough to
+// sweep the whole address space for without needing any class knowledge.
+//
+// Layouts matched, at 4-byte alignment:
+//     [X][0][Z]      [0][X][Z]      [X][Z][0]      [X][0][Z][pad]
+//
+// ------------------------------------------------------------
+static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
+                      float minV, float maxV) {
+    const uint64_t span = kPageSize + kPageOverlap;
+    printf("[*] findpos %016llX - %016llX  range [%.0f, %.0f]\n",
+           (unsigned long long)start, (unsigned long long)end, minV, maxV);
+    fflush(stdout);
+
+    std::vector<BatchReadRequest> reqs(kBatchPages);
+    std::vector<uint8_t> buf((size_t)kBatchPages * span);
+
+    uint64_t hits = 0, scanned = 0;
+    double t0 = Now();
+
+    for (uint64_t base = start; base < end; base += (uint64_t)kBatchPages * kPageSize) {
+        UINT32 np = 0;
+        for (; np < kBatchPages; ++np) {
+            uint64_t a = base + (uint64_t)np * kPageSize;
+            if (a >= end) break;
+            reqs[np].address          = a;
+            reqs[np].size             = span;
+            reqs[np].offset_in_buffer = (SIZE_T)np * span;
+        }
+        if (!np) break;
+
+        kd.BatchRead(pid, reqs.data(), np, buf.data(), (size_t)np * span);
+        size_t used = (size_t)np * span;
+
+        for (size_t o = 0; o + 12 <= used; o += 4) {
+            float a, b, c;
+            memcpy(&a, buf.data() + o, 4);
+            memcpy(&b, buf.data() + o + 4, 4);
+            memcpy(&c, buf.data() + o + 8, 4);
+
+            bool ok = false;
+            const char* form = "";
+            if (a != 0.0f && b == 0.0f && c != 0.0f) { ok = true; form = "X0Z"; }
+            else if (a == 0.0f && b != 0.0f && c != 0.0f) { ok = true; form = "0XZ"; }
+            else if (a != 0.0f && b != 0.0f && c == 0.0f) { ok = true; form = "XZ0"; }
+            if (!ok) continue;
+
+            auto inRange = [&](float v) {
+                return v >= minV && v <= maxV && v == v && fabsf(v) < 1e7f;
+            };
+            if (form[0] == 'X' && form[1] == '0') {
+                if (!inRange(a) || !inRange(c)) continue;
+            } else if (form[0] == '0') {
+                if (!inRange(b) || !inRange(c)) continue;
+            } else {
+                if (!inRange(a) || !inRange(b)) continue;
+            }
+            if (hits < 3000) {
+                printf("  POS %016llX  %s  (%9.2f, %9.2f, %9.2f)\n",
+                       (unsigned long long)(base + o), form, a, b, c);
+                fflush(stdout);
+            }
+            ++hits;
+        }
+
+        scanned += (uint64_t)np * kPageSize;
+        if (((base - start) & 0x3FFF000ull) == 0) {
+            double el = Now() - t0;
+            double mb = (double)(base - start) / 1048576.0;
+            printf("   %8.1f MB  hits=%llu  %6.1f MB/s\n",
+                   mb, (unsigned long long)hits, el > 0 ? mb / el : 0);
+            fflush(stdout);
+        }
+    }
+
+    printf("[=] done in %.1fs: %llu position candidates\n", Now() - t0,
+           (unsigned long long)hits);
+    return 0;
+}
+
+// ------------------------------------------------------------
 // IL2CPP global-metadata header
 // ------------------------------------------------------------
 struct MetaHeader {
@@ -1236,6 +1321,12 @@ int main(int argc, char** argv) {
         uint64_t a = strtoull(argv[2], nullptr, 16);
         uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x100;
         rc = CmdFindObj(kd, pid, a, (size_t)n);
+    } else if (cmd == "findpos" && argc >= 3) {
+        uint64_t s = strtoull(argv[2], nullptr, 16);
+        uint64_t e = strtoull(argv[3], nullptr, 16);
+        float    lo = argc >= 4 ? (float)atof(argv[4]) : 20.0f;
+        float    hi = argc >= 5 ? (float)atof(argv[5]) : 9300.0f;
+        rc = CmdFindPos(kd, pid, s, e, lo, hi);
     } else if (cmd == "diffscan" && argc >= 3) {
         uint64_t s = strtoull(argv[2], nullptr, 16);
         uint64_t e = strtoull(argv[3], nullptr, 16);
