@@ -232,6 +232,94 @@ static void ScanModule(KernelDriver& kd, DWORD pid,
 }
 
 // ------------------------------------------------------------
+// Scan a range for 8-byte little-endian pointers equal to `target`.
+// Used to locate IL2CPP runtime objects (Il2CppClass, Il2CppType,
+// metadata registration entries) by the address of their name string.
+//
+//   scanner findptr 2A717399
+// ------------------------------------------------------------
+static std::vector<uint64_t> g_ptr_hits;
+
+static void ScanValue(KernelDriver& kd, DWORD pid,
+                      uint64_t start, uint64_t end, uint64_t target,
+                      const char* label) {
+    if (end <= start) return;
+
+    const uint64_t span = kPageSize + kPageOverlap;
+    const uint64_t total = end - start;
+    uint64_t scanned = 0;
+    double t0 = Now();
+
+    printf("[*] findptr %016llX in %-12s %016llX - %016llX (%.2f GB)\n",
+           (unsigned long long)target, label,
+           (unsigned long long)start, (unsigned long long)end,
+           total / (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+
+    std::vector<BatchReadRequest> reqs;
+    std::vector<uint8_t>           out;
+    reqs.reserve(kBatchPages);
+    out.resize((size_t)kBatchPages * span);
+
+    while (start < end) {
+        reqs.clear();
+        for (UINT32 i = 0; i < kBatchPages && start < end; ++i) {
+            BatchReadRequest r = {};
+            r.address          = start;
+            r.size             = span;
+            r.offset_in_buffer = (SIZE_T)i * span;
+            reqs.push_back(r);
+            start += kPageSize;
+        }
+        if (reqs.empty()) break;
+
+        kd.BatchRead(pid, reqs.data(), (UINT32)reqs.size(),
+                     out.data(), (SIZE_T)reqs.size() * span);
+
+        for (UINT32 i = 0; i < reqs.size(); ++i) {
+            const uint8_t* p = out.data() + (size_t)i * span;
+            uint64_t base = reqs[i].address;
+            // pointers are 8-aligned; step 8 from the (page-aligned) base
+            for (uint64_t o = 0; o + 8 <= span; o += 8) {
+                uint64_t v;
+                memcpy(&v, p + o, 8);
+                if (v == target) {
+                    uint64_t at = base + o;
+                    g_ptr_hits.push_back(at);
+                    printf("[+] PTR HIT %016llX -> %016llX\n",
+                           (unsigned long long)at, (unsigned long long)v);
+                    fflush(stdout);
+                }
+            }
+        }
+
+        scanned += (uint64_t)reqs.size() * kPageSize;
+        if ((scanned & 0x3FFF000ull) == 0) {
+            double el = Now() - t0;
+            printf("    %6.2f GB scanned  %6.1f MB/s  hits=%zu\n",
+                   scanned / (1024.0 * 1024.0 * 1024.0),
+                   el > 0 ? (scanned / 1048576.0) / el : 0, g_ptr_hits.size());
+            fflush(stdout);
+        }
+    }
+
+    printf("[*] findptr done in %.1fs, %zu hits\n\n", Now() - t0, g_ptr_hits.size());
+}
+
+static int CmdFindPtr(KernelDriver& kd, DWORD pid, uint64_t target,
+                      const std::vector<Range>& extra) {
+    for (size_t i = 0; i < kDefaultRangeCount; ++i)
+        ScanValue(kd, pid, kDefaultRanges[i].start, kDefaultRanges[i].end,
+                  target, kDefaultRanges[i].label);
+
+    for (const auto& r : extra)
+        ScanValue(kd, pid, r.start, r.end, target, "custom");
+
+    printf("[=] %zu pointer(s) to %016llX\n", g_ptr_hits.size(), (unsigned long long)target);
+    return g_ptr_hits.size() ? 0 : 1;
+}
+
+// ------------------------------------------------------------
 // IL2CPP global-metadata header
 // ------------------------------------------------------------
 struct MetaHeader {
@@ -597,6 +685,7 @@ int main(int argc, char** argv) {
         printf("  scanner read   <addr> <size>\n");
         printf("  scanner pe     <moduleName> <file>\n");
         printf("  scanner selftest           validate the whole chain on this process\n");
+        printf("  scanner findptr <hexValue> scan for 8-byte pointers to a value\n");
         printf("  common: --pid <n>   --self   --deep   --range START:END\n");
         return 1;
     }
@@ -675,6 +764,15 @@ int main(int argc, char** argv) {
         rc = CmdPe(kd, pid, wmod, argv[3]);
     } else if (cmd == "selftest") {
         rc = CmdSelfTest(kd, pid);
+    } else if (cmd == "findptr" && argc >= 3) {
+        uint64_t target = strtoull(argv[2], nullptr, 16);
+        std::vector<Range> deepRanges;
+        if (deep) {
+            for (size_t i = 0; i < kDeepRangeCount; ++i)
+                deepRanges.push_back(kDeepRanges[i]);
+        }
+        for (const auto& r : deepRanges) extra.push_back(r);
+        rc = CmdFindPtr(kd, pid, target, extra);
     } else {
         printf("[!] unknown command '%s'\n", cmd.c_str());
         rc = 1;
