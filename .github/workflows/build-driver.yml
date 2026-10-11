@@ -35,15 +35,17 @@ jobs:
       - name: List build output
         shell: pwsh
         run: |
-          if (Test-Path build) { Get-ChildItem build -Recurse | Format-Table Name, Length }
+          if (Test-Path km\build) { Get-ChildItem km\build -Recurse | Format-Table Name, Length }
+          Copy-Item km\build\km.sys out\codmdrv.sys -Force -ErrorAction SilentlyContinue
+          Copy-Item km\build\km.pdb out\codmdrv.pdb -Force -ErrorAction SilentlyContinue
 
       - name: Upload driver
         uses: actions/upload-artifact@v4
         with:
           name: codm-esp-driver
           path: |
-            build/*.sys
-            build/*.pdb
+            km/build/km.sys
+            km/build/km.pdb
           if-no-files-found: warn
 
   build-um:
