@@ -823,7 +823,11 @@ static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
 
             // Only the strict (X, 0, Z) layout: a genuine world position has
             // a zero height, and the two horizontal components differ.
-            if (!(a != 0.0f && b == 0.0f && c != 0.0f)) continue;
+            // NB: the "zero" components are frequently tiny denormals, not a clean
+            // 0.0f (leftovers from a subtraction), so an exact == 0.0f test
+            // rejects everything. Use an epsilon.
+            const float kZero = 1e-3f;
+            if (!(fabsf(a) > 1.0f && fabsf(b) <= kZero && fabsf(c) > 1.0f)) continue;
             if (!(a >= minV && a <= maxV)) continue;
             if (!(c >= minV && c <= maxV)) continue;
             if (fabsf(a - c) < 1.0f) continue;          // reject (r, 0, r)
