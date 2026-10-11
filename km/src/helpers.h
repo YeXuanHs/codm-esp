@@ -264,8 +264,9 @@ HANDLE GetPID(const wchar_t* process_name) {
     return result;
 }
 
-// Get module base by walking PEB loader list
-PVOID GetProcessModuleBase(HANDLE processId, const wchar_t* moduleName) {
+// Get module base by walking PEB loader list.
+// out_size (optional) receives SizeOfImage.
+PVOID GetProcessModuleBase(HANDLE processId, const wchar_t* moduleName, PSIZE_T out_size) {
     PEPROCESS targetProcess = nullptr;
     NTSTATUS status = PsLookupProcessByProcessId(processId, &targetProcess);
     if (!NT_SUCCESS(status) || !targetProcess) return nullptr;
@@ -292,6 +293,7 @@ PVOID GetProcessModuleBase(HANDLE processId, const wchar_t* moduleName) {
                 RtlInitUnicodeString(&target, moduleName);
                 if (RtlEqualUnicodeString(&ldrEntry->BaseDllName, &target, TRUE)) {
                     moduleBase = ldrEntry->DllBase;
+                    if (out_size) *out_size = ldrEntry->SizeOfImage;
                     break;
                 }
             }
@@ -305,6 +307,76 @@ PVOID GetProcessModuleBase(HANDLE processId, const wchar_t* moduleName) {
     KeUnstackDetachProcess(&apcState);
     ObDereferenceObject(targetProcess);
     return moduleBase;
+}
+
+// Enumerate every loaded module of a process (PEB loader list walk).
+// Output buffer is filled with an array of MODULE_PACK_KM, terminated by a
+// zeroed entry. Caller supplies OutputBufferLength.
+NTSTATUS handle_enum_modules(PIRP irp, PIO_STACK_LOCATION stack_irp, SIZE_T* information) {
+    auto* inPack = (P_PID_PACK)irp->AssociatedIrp.SystemBuffer;
+
+    SIZE_T out_len = stack_irp->Parameters.DeviceIoControl.OutputBufferLength;
+    if (!inPack || inPack->pid == 0 || out_len < sizeof(MODULE_PACK_KM) * 2) {
+        *information = 0;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    auto* out = (PMODULE_PACK_KM)irp->AssociatedIrp.SystemBuffer;
+    SIZE_T capacity = out_len / sizeof(MODULE_PACK_KM);
+    if (capacity > 1024) capacity = 1024;
+
+    HANDLE processId = ULongToHandle(inPack->pid);
+    PEPROCESS targetProcess = nullptr;
+    NTSTATUS status = PsLookupProcessByProcessId(processId, &targetProcess);
+    if (!NT_SUCCESS(status) || !targetProcess) {
+        *information = 0;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KAPC_STATE apcState;
+    KeStackAttachProcess(targetProcess, &apcState);
+
+    SIZE_T written = 0;
+    RtlZeroMemory(out, capacity * sizeof(MODULE_PACK_KM));
+
+    __try {
+        PPEB peb = PsGetProcessPeb(targetProcess);
+        if (peb && peb->Ldr) {
+            PLIST_ENTRY listHead = &peb->Ldr->InLoadOrderModuleList;
+            PLIST_ENTRY listEntry = listHead->Flink;
+
+            while (listEntry != listHead && written < capacity) {
+                auto* ldrEntry = CONTAINING_RECORD(listEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+                if (ldrEntry->BaseDllName.Buffer && ldrEntry->BaseDllName.Length > 0) {
+                    SIZE_T copy = ldrEntry->BaseDllName.Length / sizeof(WCHAR);
+                    if (copy > 259) copy = 259;
+
+                    auto* slot = &out[written++];
+                    slot->pid = inPack->pid;
+                    slot->baseAddress = (UINT64)ldrEntry->DllBase;
+                    slot->size = ldrEntry->SizeOfImage;
+                    RtlCopyMemory(slot->moduleName, ldrEntry->BaseDllName.Buffer, copy * sizeof(WCHAR));
+                    slot->moduleName[copy] = 0;
+                }
+
+                listEntry = listEntry->Flink;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // partial list is still useful
+    }
+
+    KeUnstackDetachProcess(&apcState);
+    ObDereferenceObject(targetProcess);
+
+    // Strip the zeroed terminator entry if we filled the array completely
+    SIZE_T result_entries = written;
+    if (written == capacity) result_entries = capacity - 1;
+
+    *information = result_entries * sizeof(MODULE_PACK_KM);
+    return result_entries ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
 // Resolve process PEPROCESS with cache
@@ -375,9 +447,11 @@ NTSTATUS handle_get_module(PIRP irp, SIZE_T* information) {
 
     if (modulePack && modulePack->moduleName[0] != 0 && modulePack->pid != 0) {
         HANDLE processId = ULongToHandle(modulePack->pid);
-        PVOID baseAddr = GetProcessModuleBase(processId, modulePack->moduleName);
+        SIZE_T imageSize = 0;
+        PVOID baseAddr = GetProcessModuleBase(processId, modulePack->moduleName, &imageSize);
 
         modulePack->baseAddress = (UINT64)baseAddr;
+        modulePack->size = imageSize;
         *information = sizeof(MODULE_PACK_KM);
         return (baseAddr != nullptr) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
     }

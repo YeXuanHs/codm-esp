@@ -64,9 +64,17 @@ jobs:
           $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           cmd /c "`"$vcvars`" && cd um && cl /EHsc /std:c++17 /O2 /Fe:test_read.exe test_read.cpp /link"
 
+      - name: Build scanner
+        shell: pwsh
+        run: |
+          $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmd /c "`"$vcvars`" && cd um && cl /EHsc /std:c++17 /O2 /Fe:scanner.exe scanner.cpp /link"
+
       - name: Upload um test
         uses: actions/upload-artifact@v4
         with:
           name: codm-esp-um
-          path: um/test_read.exe
+          path: |
+            um/test_read.exe
+            um/scanner.exe
           if-no-files-found: warn

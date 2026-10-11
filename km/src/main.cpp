@@ -22,6 +22,9 @@ namespace driver {
 
         constexpr ULONG batch_read =
             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+
+        constexpr ULONG enum_modules =
+            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
     }
 
     NTSTATUS create(PDEVICE_OBJECT device_object, PIRP irp) {
@@ -73,6 +76,10 @@ namespace driver {
 
         case codes::batch_read:
             status = handle_batch_read(irp, stack_irp, &information);
+            break;
+
+        case codes::enum_modules:
+            status = handle_enum_modules(irp, stack_irp, &information);
             break;
 
         default:

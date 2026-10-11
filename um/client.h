@@ -6,6 +6,8 @@
 
 #include <Windows.h>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 // Device path
 #define DEVICE_PATH L"\\\\.\\laithdriver"
@@ -16,6 +18,7 @@
 #define IOCTL_CODM_GET_MODULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
 #define IOCTL_CODM_GET_PID    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
 #define IOCTL_CODM_BATCH_READ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
+#define IOCTL_CODM_ENUM_MODULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
 
 // Limits (must match helpers.h)
 #define SINGLE_MAX_READ 0x4000   // 16KB per single read
@@ -131,7 +134,15 @@ public:
 
     // Get module base by name
     UINT64 GetModuleBase(DWORD pid, const wchar_t* moduleName) {
-        if (!IsConnected()) return 0;
+        UINT64 base = 0;
+        GetModuleInfo(pid, moduleName, &base, nullptr);
+        return base;
+    }
+
+    // Get module base AND SizeOfImage by name
+    bool GetModuleInfo(DWORD pid, const wchar_t* moduleName,
+                       UINT64* baseAddress, SIZE_T* imageSize) {
+        if (!IsConnected()) return false;
 
         MODULE_PACK_KM pack = {};
         pack.pid = pid;
@@ -139,10 +150,45 @@ public:
 
         DWORD bytes_returned = 0;
         if (!DeviceIoControl(hDevice, IOCTL_CODM_GET_MODULE,
-                &pack, sizeof(pack), &pack, sizeof(pack), &bytes_returned, nullptr)) {
-            return 0;
+                             &pack, sizeof(pack), &pack, sizeof(pack),
+                             &bytes_returned, nullptr)) {
+            return false;
         }
-        return pack.baseAddress;
+        if (baseAddress) *baseAddress = pack.baseAddress;
+        if (imageSize)   *imageSize   = pack.size;
+        return pack.baseAddress != 0;
+    }
+
+    // Enumerate every loaded module in the target process.
+    bool EnumModules(DWORD pid, std::vector<MODULE_PACK_KM>* modules) {
+        if (!IsConnected() || !modules) return false;
+        modules->clear();
+
+        PID_PACK in = {};
+        in.pid = pid;
+
+        constexpr SIZE_T kMaxModules = 512;
+        SIZE_T out_bytes = kMaxModules * sizeof(MODULE_PACK_KM);
+
+        std::vector<BYTE> out(out_bytes);
+        DWORD bytes_returned = 0;
+
+        if (!DeviceIoControl(hDevice, IOCTL_CODM_ENUM_MODULES,
+                             &in, sizeof(in),
+                             out.data(), (DWORD)out_bytes,
+                             &bytes_returned, nullptr)) {
+            return false;
+        }
+
+        SIZE_T count = bytes_returned / sizeof(MODULE_PACK_KM);
+        if (count > kMaxModules) count = kMaxModules;
+
+        auto* arr = reinterpret_cast<const MODULE_PACK_KM*>(out.data());
+        for (SIZE_T i = 0; i < count; ++i) {
+            if (arr[i].baseAddress == 0 && arr[i].moduleName[0] == 0) continue;
+            modules->push_back(arr[i]);
+        }
+        return true;
     }
 
     // Batch read: read many addresses in one ioctl
