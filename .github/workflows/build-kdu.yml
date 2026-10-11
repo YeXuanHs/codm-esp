@@ -23,19 +23,16 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Taigei Win32
-        shell: pwsh
-        run: |
-          msbuild kdu/Taigei/Taigei.vcxproj /m /p:Platform=Win32 /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=kdu\
+        working-directory: ./kdu/Taigei
+        run: msbuild Taigei.vcxproj /m /p:Platform=Win32 /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=..\
 
       - name: Build Taigei x64
-        shell: pwsh
-        run: |
-          msbuild kdu/Taigei/Taigei.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=kdu\
+        working-directory: ./kdu/Taigei
+        run: msbuild Taigei.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=..\
 
       - name: Build PCOMP
-        shell: pwsh
-        run: |
-          msbuild kdu/Utils/PCOMP/PCOMP.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=kdu/Utils/
+        working-directory: ./kdu/Utils/PCOMP
+        run: msbuild PCOMP.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=..\..\
 
       - name: Prepare compressed Taigei resources
         shell: pwsh
@@ -62,26 +59,12 @@ jobs:
           Copy-Item ".\SB_SMBUS_SDK.bin" "$resOut\SB_SMBUS_SDK.bin" -Force
 
       - name: Build Tanikaze
-        shell: pwsh
-        run: |
-          msbuild kdu/Tanikaze/Tanikaze.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=kdu\
+        working-directory: ./kdu/Tanikaze
+        run: msbuild Tanikaze.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=..\
 
       - name: Build Hamakaze
-        shell: pwsh
-        run: |
-          msbuild kdu/Hamakaze/KDU.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=kdu\
-
-      - name: Collect outputs
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path out\kdu | Out-Null
-          Get-ChildItem -Path kdu -Recurse -Include *.exe -File |
-            Where-Object { $_.FullName -match 'output' } |
-            ForEach-Object {
-              $rel = $_.FullName.Substring((Get-Location).Path.Length + 1) -replace '[\\/:*?"<>| ]', '_'
-              Copy-Item $_.FullName "out\kdu\$rel" -Force
-              Write-Host "collected $rel"
-            }
+        working-directory: ./kdu/Hamakaze
+        run: msbuild KDU.vcxproj /m /p:Platform=${{ env.PLATFORM }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:PlatformToolset=v143 /p:SolutionDir=..\
 
       - name: Upload KDU
         uses: actions/upload-artifact@v4
@@ -90,5 +73,6 @@ jobs:
           path: |
             kdu/Hamakaze/output/**
             kdu/Tanikaze/output/**
-            out/kdu/**
+            kdu/Taigei/output/**
+            kdu/Utils/PCOMP/output/**
           if-no-files-found: warn
