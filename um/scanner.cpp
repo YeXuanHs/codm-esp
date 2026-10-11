@@ -510,6 +510,75 @@ static int CmdMeta(KernelDriver& kd, DWORD pid, bool deep) {
 }
 
 // ------------------------------------------------------------
+// Self test: plant a synthetic IL2CPP metadata header in our own
+// address space, then run the real scan/dump path against it. This
+// validates driver IOCTLs, module enumeration, page scanning and the
+// blob dumper without needing the game running.
+//
+//   scanner.exe selftest
+// ------------------------------------------------------------
+static int CmdSelfTest(KernelDriver& kd, DWORD pid) {
+    const size_t kSize = 0x20000;                 // 128 KB "blob"
+    uint8_t* blob = (uint8_t*)VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!blob) { printf("[!] VirtualAlloc failed\n"); return 2; }
+
+    memset(blob, 0xCC, kSize);                     // poison
+    const uint32_t sanity = 0xFAB11BAF;
+    const int32_t  version = 29;
+    memcpy(blob, &sanity, 4);
+    memcpy(blob + 4, &version, 4);
+    // one populated table so the parser has something to chew on
+    uint32_t strOff = 0x100, strCount = 16;
+    memcpy(blob + 8, &strOff, 4);
+    memcpy(blob + 12, &strCount, 4);
+    const char* s = "SELFTEST_STRING";
+    memcpy(blob + strOff, s, strlen(s) + 1);
+    // filler tail (zeros) so the dumper terminates the blob
+    memset(blob + 0x1000, 0, kSize - 0x1000);
+
+    uint64_t addr = (uint64_t)blob;
+    printf("[+] Planted synthetic metadata at %016llX (%zu bytes)\n",
+           (unsigned long long)addr, kSize);
+
+    // 1) module enumeration must work
+    std::vector<MODULE_PACK_KM> mods;
+    if (kd.EnumModules(pid, &mods))
+        printf("[+] EnumModules OK: %zu modules\n", mods.size());
+    else
+        printf("[!] EnumModules FAILED\n");
+
+    // 2) single read back
+    uint32_t check = 0;
+    if (kd.Read(pid, addr, &check, 4) && check == sanity)
+        printf("[+] Read OK (sanity 0x%08X)\n", check);
+    else
+        printf("[!] Read FAILED\n");
+
+    // 3) batch read path
+    BatchReadRequest br = {};
+    uint8_t page[0x1010] = {};
+    br.address = addr; br.size = sizeof(page); br.offset_in_buffer = 0;
+    if (kd.BatchRead(pid, &br, 1, page, sizeof(page)) && page[0] == 0xAF)
+        printf("[+] BatchRead OK (first byte 0x%02X)\n", page[0]);
+    else
+        printf("[!] BatchRead FAILED (first byte 0x%02X)\n", page[0]);
+
+    // 4) magic scan over a range that definitely covers us
+    printf("[*] Scanning 0x10000 - 0x10000000 for the magic ...\n");
+    ScanRange(kd, pid, 0x10000, 0x10000000, "selftest");
+
+    // 5) dump the blob through the normal dumper
+    CreateDirectoryA("out", nullptr);
+    if (DumpMetadataBlob(kd, pid, addr, "out/selftest_meta.bin"))
+        printf("[+] selftest blob -> out/selftest_meta.bin\n");
+
+    VirtualFree(blob, 0, MEM_RELEASE);
+
+    printf("\n[=] hits: %zu\n", g_hits.size());
+    return g_hits.size() ? 0 : 1;
+}
+
+// ------------------------------------------------------------
 // main
 // ------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -523,6 +592,8 @@ int main(int argc, char** argv) {
         printf("  scanner dump   <addr> <size> <file>\n");
         printf("  scanner read   <addr> <size>\n");
         printf("  scanner pe     <moduleName> <file>\n");
+        printf("  scanner selftest           validate the whole chain on this process\n");
+        printf("  common: --pid <n>   --self   --deep   --range START:END\n");
         return 1;
     }
 
@@ -533,21 +604,22 @@ int main(int argc, char** argv) {
     }
     printf("[+] Driver connected: %ls\n", kd.activePath);
 
-    DWORD pid = FindTargetPid(kd);
-    if (!pid) {
-        printf("[!] CODM process not found. Launch the game first.\n");
-        return 3;
-    }
-    kd.Attach(pid);
-
+    // Option parsing happens before target resolution so that --pid/--self
+    // can override the default CODM process lookup.
     std::string cmd = argv[1];
-    bool deep = false;
+    bool   deep = false;
+    bool   self = false;
+    DWORD  forcedPid = 0;
     std::vector<Range> extra;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--deep") {
             deep = true;
+        } else if (a == "--self") {
+            self = true;
+        } else if (a == "--pid" && i + 1 < argc) {
+            forcedPid = (DWORD)strtoul(argv[++i], nullptr, 0);
         } else if (a == "--range" && i + 1 < argc) {
             unsigned long long s = 0, e = 0;
             if (sscanf(argv[++i], "%llx:%llx", &s, &e) == 2) {
@@ -557,6 +629,28 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    DWORD pid;
+    if (self) {
+        pid = GetCurrentProcessId();
+        printf("[+] Target process: self (PID %u)\n", pid);
+    } else if (forcedPid) {
+        pid = forcedPid;
+        printf("[+] Target process: forced PID %u\n", pid);
+    } else {
+        pid = FindTargetPid(kd);
+        if (!pid) {
+            if (cmd == "selftest") {
+                pid = GetCurrentProcessId();
+                printf("[+] CODM not running; selftest targets self (PID %u)\n", pid);
+            } else {
+                printf("[!] CODM process not found. Launch the game first.\n");
+                printf("    (use --pid <n> or --self to target another process)\n");
+                return 3;
+            }
+        }
+    }
+    kd.Attach(pid);
 
     int rc = 0;
     if (cmd == "modules") {
@@ -575,6 +669,8 @@ int main(int argc, char** argv) {
         wchar_t wmod[260];
         MultiByteToWideChar(CP_ACP, 0, argv[2], -1, wmod, 260);
         rc = CmdPe(kd, pid, wmod, argv[3]);
+    } else if (cmd == "selftest") {
+        rc = CmdSelfTest(kd, pid);
     } else {
         printf("[!] unknown command '%s'\n", cmd.c_str());
         rc = 1;
