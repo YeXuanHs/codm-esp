@@ -320,6 +320,167 @@ static int CmdFindPtr(KernelDriver& kd, DWORD pid, uint64_t target,
 }
 
 // ------------------------------------------------------------
+// Byte-pattern scan: find every copy of an ASCII string in memory.
+// IL2CPP keeps its own heap copies of type names, so the runtime
+// Il2CppClass->name points at one of these, not at the metadata blob.
+//
+//   scanner findstr A2DCharacterBaseData
+// ------------------------------------------------------------
+static std::vector<uint64_t> g_str_hits;
+
+static void ScanPattern(KernelDriver& kd, DWORD pid,
+                        uint64_t start, uint64_t end,
+                        const std::vector<uint8_t>& pat,
+                        const char* label) {
+    if (end <= start || pat.empty()) return;
+
+    const uint64_t span = kPageSize + kPageOverlap;
+    uint64_t scanned = 0;
+    double t0 = Now();
+
+    printf("[*] findstr (%zu bytes) in %-12s %016llX - %016llX\n",
+           pat.size(), label,
+           (unsigned long long)start, (unsigned long long)end);
+    fflush(stdout);
+
+    std::vector<BatchReadRequest> reqs;
+    std::vector<uint8_t>           out;
+    reqs.reserve(kBatchPages);
+    out.resize((size_t)kBatchPages * span);
+
+    while (start < end) {
+        reqs.clear();
+        for (UINT32 i = 0; i < kBatchPages && start < end; ++i) {
+            BatchReadRequest r = {};
+            r.address          = start;
+            r.size             = span;
+            r.offset_in_buffer = (SIZE_T)i * span;
+            reqs.push_back(r);
+            start += kPageSize;
+        }
+        if (reqs.empty()) break;
+
+        kd.BatchRead(pid, reqs.data(), (UINT32)reqs.size(),
+                     out.data(), (SIZE_T)reqs.size() * span);
+
+        for (UINT32 i = 0; i < reqs.size(); ++i) {
+            const uint8_t* p = out.data() + (size_t)i * span;
+            size_t limit = (size_t)span - pat.size();
+            for (size_t o = 0; o <= limit; ++o) {
+                if (memcmp(p + o, pat.data(), pat.size()) == 0) {
+                    uint64_t at = reqs[i].address + o;
+                    g_str_hits.push_back(at);
+                    printf("[+] STR HIT %016llX\n", (unsigned long long)at);
+                    fflush(stdout);
+                }
+            }
+        }
+
+        scanned += (uint64_t)reqs.size() * kPageSize;
+        if ((scanned & 0x3FFF000ull) == 0) {
+            double el = Now() - t0;
+            printf("    %6.2f GB scanned  %6.1f MB/s  hits=%zu\n",
+                   scanned / (1024.0 * 1024.0 * 1024.0),
+                   el > 0 ? (scanned / 1048576.0) / el : 0, g_str_hits.size());
+            fflush(stdout);
+        }
+    }
+
+    printf("[*] findstr done in %.1fs, %zu hits\n\n", Now() - t0, g_str_hits.size());
+}
+
+static int CmdFindStr(KernelDriver& kd, DWORD pid, const char* text,
+                      const std::vector<Range>& extra) {
+    std::vector<uint8_t> pat(text, text + strlen(text));
+    pat.push_back(0);
+
+    for (size_t i = 0; i < kDefaultRangeCount; ++i)
+        ScanPattern(kd, pid, kDefaultRanges[i].start, kDefaultRanges[i].end,
+                    pat, kDefaultRanges[i].label);
+    for (const auto& r : extra)
+        ScanPattern(kd, pid, r.start, r.end, pat, "custom");
+
+    printf("[=] %zu copy/copies of \"%s\"\n", g_str_hits.size(), text);
+    return g_str_hits.size() ? 0 : 1;
+}
+
+// ------------------------------------------------------------
+// Structure probe: dump 256 bytes as qwords and, for every value that
+// looks like a pointer into a mapped page, try to render it as a string.
+// Used to reverse the (custom, non-stock) Il2CppClass layout.
+// ------------------------------------------------------------
+static bool LooksLikeString(KernelDriver& kd, DWORD pid, uint64_t addr, char* outBuf,
+                            size_t bufSize) {
+    uint8_t tmp[64] = {};
+    if (!kd.Read(pid, addr, tmp, 48)) return false;
+    size_t n = 0;
+    for (; n < 48 && tmp[n]; ++n) {
+        if (tmp[n] < 0x20 || tmp[n] > 0x7E) return false;
+        outBuf[n] = (char)tmp[n];
+    }
+    if (n < 2 || n >= bufSize) return false;
+    outBuf[n] = 0;
+    return true;
+}
+
+static int CmdProbe(KernelDriver& kd, DWORD pid, uint64_t addr, size_t bytes) {
+    if (bytes < 8 || bytes > 0x400) bytes = 0x100;
+    std::vector<uint8_t> buf(bytes);
+    if (!ReadBlock(kd, pid, addr, buf.data(), bytes)) {
+        printf("[!] Read failed at %016llX\n", (unsigned long long)addr);
+        return 2;
+    }
+
+    printf("== probe %016llX (%zu bytes) ==\n", (unsigned long long)addr, bytes);
+    for (size_t o = 0; o + 8 <= bytes; o += 8) {
+        uint64_t v;
+        memcpy(&v, buf.data() + o, 8);
+        printf("  +0x%02X  %016llX", (unsigned)o, (unsigned long long)v);
+
+        char s[64];
+        if (v >= kMinUserAddr && v < kMaxUserAddr &&
+            LooksLikeString(kd, pid, v, s, sizeof(s))) {
+            printf("   -> \"%s\"", s);
+        } else if (v == 0) {
+            printf("   (null)");
+        }
+        printf("\n");
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
+// findclass <TypeName>: findstr for the name, then findptr on each copy,
+// then probe every candidate. This walks name-string -> Il2CppClass without
+// knowing anything about the (custom) Il2CppClass layout.
+// ------------------------------------------------------------
+static int CmdFindClass(KernelDriver& kd, DWORD pid, const char* name,
+                        const std::vector<Range>& extra) {
+    // 1) every heap copy of the type name
+    CmdFindStr(kd, pid, name, extra);
+    if (g_str_hits.empty()) {
+        printf("[!] no copy of \"%s\" found\n", name);
+        return 1;
+    }
+
+    // 2) pointers to each copy -> Il2CppClass (or whatever holds the name)
+    for (uint64_t s : g_str_hits) {
+        g_ptr_hits.clear();
+        for (size_t i = 0; i < kDefaultRangeCount; ++i)
+            ScanValue(kd, pid, kDefaultRanges[i].start, kDefaultRanges[i].end,
+                      s, kDefaultRanges[i].label);
+        for (const auto& r : extra)
+            ScanValue(kd, pid, r.start, r.end, s, "custom");
+
+        printf("\n===== string %016llX : %zu referrer(s) =====\n",
+               (unsigned long long)s, g_ptr_hits.size());
+        for (uint64_t p : g_ptr_hits)
+            CmdProbe(kd, pid, p >= 8 ? p - 8 : p, 0x80);
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
 // IL2CPP global-metadata header
 // ------------------------------------------------------------
 struct MetaHeader {
@@ -422,7 +583,7 @@ static DWORD FindTargetPid(KernelDriver& kd) {
     for (const wchar_t* n : kNames) {
         DWORD pid = kd.GetPID(n);
         if (pid) {
-            printf("[+] Target process: %s (PID %u)\n", n, pid);
+            printf("[+] Target process: %ls (PID %u)\n", n, pid);
             return pid;
         }
     }
@@ -686,6 +847,9 @@ int main(int argc, char** argv) {
         printf("  scanner pe     <moduleName> <file>\n");
         printf("  scanner selftest           validate the whole chain on this process\n");
         printf("  scanner findptr <hexValue> scan for 8-byte pointers to a value\n");
+        printf("  scanner findstr <text>      scan for ASCII copies of a string\n");
+        printf("  scanner probe <addr> [n]   dump n bytes as qwords, render strings\n");
+        printf("  scanner findclass <name>   name string -> referrers -> structure probe\n");
         printf("  common: --pid <n>   --self   --deep   --range START:END\n");
         return 1;
     }
@@ -773,6 +937,14 @@ int main(int argc, char** argv) {
         }
         for (const auto& r : deepRanges) extra.push_back(r);
         rc = CmdFindPtr(kd, pid, target, extra);
+    } else if (cmd == "findclass" && argc >= 3) {
+        rc = CmdFindClass(kd, pid, argv[2], extra);
+    } else if (cmd == "findstr" && argc >= 3) {
+        rc = CmdFindStr(kd, pid, argv[2], extra);
+    } else if (cmd == "probe" && argc >= 3) {
+        uint64_t a = strtoull(argv[2], nullptr, 16);
+        uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x100;
+        rc = CmdProbe(kd, pid, a, (size_t)n);
     } else {
         printf("[!] unknown command '%s'\n", cmd.c_str());
         rc = 1;
