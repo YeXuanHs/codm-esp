@@ -784,6 +784,77 @@ static int CmdDiffScan(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end
 //     [X][0][Z]      [0][X][Z]      [X][Z][0]      [X][0][Z][pad]
 //
 // ------------------------------------------------------------
+static int static int CmdFindOffs(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
+                       UINT32 count, UINT32 minFirst, UINT32 maxVal) {
+    const uint64_t span = kPageSize + kPageOverlap;
+    printf("[*] findoffs count=%u first<=%u max=%u over %016llX - %016llX\n",
+           count, minFirst, maxVal,
+           (unsigned long long)start, (unsigned long long)end);
+    fflush(stdout);
+
+    std::vector<BatchReadRequest> reqs(kBatchPages);
+    std::vector<uint8_t> buf((size_t)kBatchPages * span);
+    const size_t need = (size_t)count * 4;
+
+    UINT64 hits = 0, scanned = 0;
+    double t0 = Now();
+
+    for (uint64_t base = start; base < end; base += (uint64_t)kBatchPages * kPageSize) {
+        UINT32 np = 0;
+        for (; np < kBatchPages; ++np) {
+            uint64_t a = base + (uint64_t)np * kPageSize;
+            if (a >= end) break;
+            reqs[np].address          = a;
+            reqs[np].size             = span;
+            reqs[np].offset_in_buffer = (SIZE_T)np * span;
+        }
+        if (!np) break;
+        size_t used = (size_t)np * span;
+        kd.BatchRead(pid, reqs.data(), np, buf.data(), used);
+
+        for (size_t o = 0; o + need <= used; o += 4) {
+            UINT32 first;
+            memcpy(&first, buf.data() + o, 4);
+            if (first > minFirst) continue;
+
+            UINT32 prev = 0;
+            bool ok = true;
+            for (UINT32 k = 0; k < count; ++k) {
+                UINT32 v;
+                memcpy(&v, buf.data() + o + (size_t)k * 4, 4);
+                if (v < prev || v > maxVal) { ok = false; break; }
+                prev = v;
+            }
+            if (!ok || prev < maxVal / 2) continue;
+
+            printf("  OFFS %016llX  first=%u last=%u count=%u\n",
+                   (unsigned long long)(base + o), first, prev, count);
+            if (hits < 200) {
+                for (UINT32 k = 0; k < count && k < 48; ++k) {
+                    UINT32 v;
+                    memcpy(&v, buf.data() + o + (size_t)k * 4, 4);
+                    printf("        [%u] = 0x%X\n", k, v);
+                }
+            }
+            fflush(stdout);
+            ++hits;
+            o += need - 4;
+        }
+
+        scanned += (uint64_t)np * kPageSize;
+        if (((base - start) & 0x3FFF000ull) == 0) {
+            double el = Now() - t0;
+            double mb = (double)(base - start) / 1048576.0;
+            printf("   %8.1f MB  hits=%llu  %6.1f MB/s\n",
+                   mb, (unsigned long long)hits, el > 0 ? mb / el : 0);
+            fflush(stdout);
+        }
+    }
+
+    printf("[=] done in %.1fs: %llu offset arrays\n", Now() - t0, (unsigned long long)hits);
+    return hits ? 0 : 1;
+}
+
 static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
                       float minV, float maxV,
                       bool useRef, float refX, float refZ, float maxDist) {
@@ -1325,6 +1396,13 @@ int main(int argc, char** argv) {
         uint64_t a = strtoull(argv[2], nullptr, 16);
         uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x100;
         rc = CmdFindObj(kd, pid, a, (size_t)n);
+    } else if (cmd == "findoffs" && argc >= 5) {
+        uint64_t s = strtoull(argv[2], nullptr, 16);
+        uint64_t e = strtoull(argv[3], nullptr, 16);
+        UINT32  c = (UINT32)strtoul(argv[4], nullptr, 0);
+        UINT32  mn = argc >= 6 ? (UINT32)strtoul(argv[5], nullptr, 0) : 0x20;
+        UINT32  mx = argc >= 7 ? (UINT32)strtoul(argv[6], nullptr, 0) : 0x10000;
+        rc = CmdFindOffs(kd, pid, s, e, c, mn, mx);
     } else if (cmd == "findpos" && argc >= 3) {
         uint64_t s = strtoull(argv[2], nullptr, 16);
         uint64_t e = strtoull(argv[3], nullptr, 16);
