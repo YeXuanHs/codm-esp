@@ -1,0 +1,7 @@
+build_out/
+tools/
+out/
+*.sys
+*.pdb
+*.exe
+*.log
