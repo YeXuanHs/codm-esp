@@ -104,7 +104,7 @@ NTSTATUS driver_main(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path
 
     // Device name
     UNICODE_STRING device_name = {};
-    RtlInitUnicodeString(&device_name, L"\\Device\\codmscan");
+    RtlInitUnicodeString(&device_name, L"\\Device\\laithdriver");
 
     PDEVICE_OBJECT device_object = nullptr;
     NTSTATUS status = IoCreateDevice(driver_object, 0, &device_name, FILE_DEVICE_UNKNOWN,
@@ -117,7 +117,7 @@ NTSTATUS driver_main(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path
 
     // Symbolic link
     UNICODE_STRING symbolic_link = {};
-    RtlInitUnicodeString(&symbolic_link, L"\\DosDevices\\codmscan");
+    RtlInitUnicodeString(&symbolic_link, L"\\DosDevices\\laithdriver");
 
     status = IoCreateSymbolicLink(&symbolic_link, &device_name);
     if (!NT_SUCCESS(status)) {
@@ -144,7 +144,7 @@ NTSTATUS DriverEntry() {
     debug_print("CODM ESP: DriverEntry called\n");
 
     UNICODE_STRING driver_name = {};
-    RtlInitUnicodeString(&driver_name, L"\\Driver\\codmscan");
+    RtlInitUnicodeString(&driver_name, L"\\Driver\\laithdriver");
 
     return IoCreateDriver(&driver_name, &driver_main);
 }
