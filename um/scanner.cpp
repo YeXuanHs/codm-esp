@@ -481,6 +481,203 @@ static int CmdFindClass(KernelDriver& kd, DWORD pid, const char* name,
 }
 
 // ------------------------------------------------------------
+// probeobj <addr> <size>
+//
+// Walks an object slot by slot and annotates every 8-byte field. The
+// Il2CppClass layout in this build is confirmed as:
+//     +0x10 name (metadata string)   +0x18 namespace
+// so any slot that points at a class can be printed by name, and any slot
+// that points straight at printable text is a runtime string.
+// ------------------------------------------------------------
+static bool ReadCString(KernelDriver& kd, DWORD pid, uint64_t addr,
+                        char* out, size_t outSize) {
+    uint8_t tmp[96] = {};
+    if (!kd.Read(pid, addr, tmp, sizeof(tmp))) return false;
+    size_t n = 0;
+    for (; n < sizeof(tmp) && tmp[n]; ++n) {
+        if (tmp[n] < 0x20 || tmp[n] > 0x7E) return false;
+        out[n] = (char)tmp[n];
+    }
+    if (n < 2 || n >= outSize) return false;
+    out[n] = 0;
+    return true;
+}
+
+static int CmdProbeObj(KernelDriver& kd, DWORD pid, uint64_t addr, size_t size) {
+    if (size == 0 || size > 0x8000) size = 0x1000;
+    std::vector<uint8_t> buf(size);
+    if (!ReadBlock(kd, pid, addr, buf.data(), size)) {
+        printf("[!] Read failed at %016llX\n", (unsigned long long)addr);
+        return 2;
+    }
+
+    printf("== probeobj %016llX (%zu bytes) ==\n", (unsigned long long)addr, size);
+    size_t slots = size / 8;
+
+    for (size_t i = 0; i < slots; ++i) {
+        uint64_t v;
+        memcpy(&v, buf.data() + i * 8, 8);
+
+        char s[96];
+        const char* tag = nullptr;
+
+        if (v == 0) {
+            tag = "null";
+        } else if (v >= kMinUserAddr && v < kMaxUserAddr) {
+            // 1) does it point at an Il2CppClass? (name@+0x10, ns@+0x18)
+            char name[64] = {}, ns[64] = {};
+            if (ReadCString(kd, pid, v + 0x10, name, sizeof(name)) &&
+                ReadCString(kd, pid, v + 0x18, ns, sizeof(ns))) {
+                printf("  +0x%04X  %016llX  class %s.%s\n", (unsigned)(i * 8),
+                       (unsigned long long)v, ns, name);
+                continue;
+            }
+            // 2) is it a plain runtime string?
+            if (ReadCString(kd, pid, v, s, sizeof(s))) {
+                printf("  +0x%04X  %016llX  str  \"%s\"\n", (unsigned)(i * 8),
+                       (unsigned long long)v, s);
+                continue;
+            }
+            tag = "ptr";
+        } else {
+            tag = "imm";
+        }
+
+        uint32_t lo = (uint32_t)(v & 0xFFFFFFFF);
+        uint32_t hi = (uint32_t)(v >> 32);
+        float  f;
+        memcpy(&f, &lo, 4);
+
+        if (tag && !strcmp(tag, "imm")) {
+            if (hi == 0) {
+                if (lo < 0x10000)
+                    printf("  +0x%04X  %016llX  int  %u\n", (unsigned)(i * 8),
+                           (unsigned long long)v, lo);
+                else
+                    printf("  +0x%04X  %016llX  flt  %g\n", (unsigned)(i * 8),
+                           (unsigned long long)v, (double)f);
+            } else {
+                printf("  +0x%04X  %016llX  raw  %u:%u\n", (unsigned)(i * 8),
+                       (unsigned long long)v, hi, lo);
+            }
+        } else {
+            printf("  +0x%04X  %016llX  %s\n", (unsigned)(i * 8),
+                   (unsigned long long)v, tag);
+        }
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
+// findobj <classAddr> [size]
+//
+// findptr hits are mostly type-registration tables, so keep only the
+// candidates that look like real managed objects: the whole instance must be
+// readable and a meaningful share of the slots must point back into the
+// process.
+// ------------------------------------------------------------
+static int CmdFindObj(KernelDriver& kd, DWORD pid, uint64_t classAddr,
+                      size_t instSize) {
+    g_ptr_hits.clear();
+    for (size_t i = 0; i < kDefaultRangeCount; ++i)
+        ScanValue(kd, pid, kDefaultRanges[i].start, kDefaultRanges[i].end,
+                  classAddr, kDefaultRanges[i].label);
+    for (size_t i = 0; i < kDeepRangeCount; ++i)
+        ScanValue(kd, pid, kDeepRanges[i].start, kDeepRanges[i].end,
+                  classAddr, kDeepRanges[i].label);
+
+    if (instSize == 0) instSize = 0x100;
+    printf("\n[=] %zu raw references; validating as instances...\n", g_ptr_hits.size());
+
+    std::vector<uint8_t> buf(instSize);
+    size_t good = 0;
+    for (uint64_t a : g_ptr_hits) {
+        if (!ReadBlock(kd, pid, a, buf.data(), instSize)) continue;
+        size_t slots = instSize / 8;
+        size_t ptrs = 0, nonzero = 0;
+        for (size_t i = 1; i < slots; ++i) {
+            uint64_t v;
+            memcpy(&v, buf.data() + i * 8, 8);
+            if (!v) continue;
+            ++nonzero;
+            if (v >= kMinUserAddr && v < kMaxUserAddr) ++ptrs;
+        }
+        // a real object of this class has plenty of live references and data
+        if (ptrs < 3 || nonzero < 4) continue;
+        ++good;
+        printf("  OBJ %016llX  ptrs=%zu/%zu nonzero=%zu\n",
+               (unsigned long long)a, ptrs, slots, nonzero);
+    }
+    printf("[=] %zu plausible objects\n", good);
+    return good ? 0 : 1;
+}
+
+// ------------------------------------------------------------
+// findoffsets <classAddr>
+//
+// Tencent's build keeps fieldOffsets out of the obvious stock slot, so try
+// every pointer in the class record and keep the ones that decode into a
+// non-decreasing uint32 array of exactly field_count entries (that is what
+// IL2CPP emits: fields are laid out sequentially from the object header).
+// ------------------------------------------------------------
+static int CmdFindOffsets(KernelDriver& kd, DWORD pid, uint64_t classAddr) {
+    uint8_t rec[0x200];
+    if (!ReadBlock(kd, pid, classAddr, rec, sizeof(rec))) {
+        printf("[!] Read failed at %016llX\n", (unsigned long long)classAddr);
+        return 2;
+    }
+
+    char nm[64] = {}, ns[64] = {};
+    ReadCString(kd, pid, classAddr + 0x10, nm, sizeof(nm));
+    ReadCString(kd, pid, classAddr + 0x18, ns, sizeof(ns));
+    printf("== class %s.%s @ %016llX ==\n", ns, nm, (unsigned long long)classAddr);
+
+    // Every uint16 in the tail of the record is a candidate count. Pair each
+    // one with every pointer slot and keep the combination that decodes into
+    // a non-decreasing offset array.
+    std::vector<uint64_t> ptrs;
+    for (size_t off = 0; off + 8 <= sizeof(rec); off += 8) {
+        uint64_t v;
+        memcpy(&v, rec + off, 8);
+        if (v >= kMinUserAddr && v < kMaxUserAddr) {
+            ptrs.push_back(v);
+            printf("   slot +0x%02X = %016llX\n", (unsigned)off, (unsigned long long)v);
+        }
+    }
+
+    std::vector<uint8_t> arr(8192 * 4);
+    int found = 0;
+    for (size_t off = 0xE8; off + 2 <= sizeof(rec); off += 2) {
+        unsigned fcount;
+        memcpy(&fcount, rec + off, 2);
+        if (fcount < 4 || fcount > 8192) continue;
+        if ((size_t)fcount * 4 > arr.size()) continue;
+
+        for (uint64_t p : ptrs) {
+            if (!ReadBlock(kd, pid, p, arr.data(), (size_t)fcount * 4)) continue;
+
+            unsigned prev = 0, first = 0;
+            bool ok = true;
+            for (unsigned k = 0; k < fcount; ++k) {
+                unsigned o;
+                memcpy(&o, arr.data() + (size_t)k * 4, 4);
+                if (k == 0) first = o;
+                if (o < prev || o > 0x100000) { ok = false; break; }
+                prev = o;
+            }
+            if (ok && first <= 0x100) {
+                printf("[+] HIT count=%u (from class+0x%02X) array=%016llX "
+                       "first=0x%X last=0x%X\n",
+                       fcount, (unsigned)off, (unsigned long long)p, first, prev);
+                ++found;
+            }
+        }
+    }
+    printf("[=] %d candidates\n", found);
+    return found ? 0 : 1;
+}
+
+// ------------------------------------------------------------
 // IL2CPP global-metadata header
 // ------------------------------------------------------------
 struct MetaHeader {
@@ -937,6 +1134,16 @@ int main(int argc, char** argv) {
         }
         for (const auto& r : deepRanges) extra.push_back(r);
         rc = CmdFindPtr(kd, pid, target, extra);
+    } else if (cmd == "probeobj" && argc >= 3) {
+        uint64_t a = strtoull(argv[2], nullptr, 16);
+        uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x1000;
+        rc = CmdProbeObj(kd, pid, a, (size_t)n);
+    } else if (cmd == "findobj" && argc >= 3) {
+        uint64_t a = strtoull(argv[2], nullptr, 16);
+        uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x100;
+        rc = CmdFindObj(kd, pid, a, (size_t)n);
+    } else if (cmd == "findoffsets" && argc >= 3) {
+        rc = CmdFindOffsets(kd, pid, strtoull(argv[2], nullptr, 16));
     } else if (cmd == "findclass" && argc >= 3) {
         rc = CmdFindClass(kd, pid, argv[2], extra);
     } else if (cmd == "findstr" && argc >= 3) {
