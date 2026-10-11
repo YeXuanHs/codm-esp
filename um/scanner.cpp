@@ -531,7 +531,7 @@ int main(int argc, char** argv) {
         printf("[!] Cannot open \\\\.\\laithdriver (is km.sys mapped?)\n");
         return 2;
     }
-    printf("[+] Driver connected\n");
+    printf("[+] Driver connected: %ls\n", kd.activePath);
 
     DWORD pid = FindTargetPid(kd);
     if (!pid) {

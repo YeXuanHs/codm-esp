@@ -9,8 +9,12 @@
 #include <cstring>
 #include <vector>
 
-// Device path
-#define DEVICE_PATH L"\\\\.\\laithdriver"
+// Device paths — probed in order (an older build may still own the first one)
+static const wchar_t* kDevicePaths[] = {
+    L"\\\\.\\codmscan",
+    L"\\\\.\\laithdriver",
+};
+#define DEVICE_PATH kDevicePaths[0]
 
 // IOCTL codes (FILE_DEVICE_UNKNOWN, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
 #define IOCTL_CODM_ATTACH     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)
@@ -69,15 +73,22 @@ typedef struct _BatchReadHeader {
 // ------------------------------------------------------------
 class KernelDriver {
 public:
-    HANDLE hDevice;
+    HANDLE    hDevice;
+    wchar_t   activePath[64] = {};
 
     KernelDriver() : hDevice(INVALID_HANDLE_VALUE) {}
     ~KernelDriver() { Disconnect(); }
 
     bool Connect() {
-        hDevice = CreateFileW(DEVICE_PATH, GENERIC_READ | GENERIC_WRITE,
-            0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return hDevice != INVALID_HANDLE_VALUE;
+        for (const wchar_t* path : kDevicePaths) {
+            hDevice = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hDevice != INVALID_HANDLE_VALUE) {
+                wcsncpy_s(activePath, path, _TRUNCATE);
+                return true;
+            }
+        }
+        return false;
     }
 
     void Disconnect() {
