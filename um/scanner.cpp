@@ -1089,6 +1089,60 @@ static int CmdScan(KernelDriver& kd, DWORD pid, bool deep,
     return 0;
 }
 
+// dumpsafe <addr> <size> <out> [<gapfile>]
+//
+// Same as dump but tolerant: on a failed chunk it retries at 4 KB page
+// granularity, zero-fills whatever is still unreadable, and records the gaps.
+// Needed for dumping the live image, where parts of the module are paged out.
+static int CmdDumpSafe(KernelDriver& kd, DWORD pid, uint64_t addr, uint64_t size,
+                       const char* outFile, const char* gapFile) {
+    if (size == 0 || size > 0x40000000ull) size = 0x1000;
+
+    FILE* f = fopen(outFile, "wb");
+    if (!f) { printf("[!] Cannot open output\n"); return 2; }
+    FILE* g = gapFile ? fopen(gapFile, "w") : nullptr;
+
+    const size_t CH = SINGLE_MAX_READ;
+    std::vector<uint8_t> buf(CH);
+    uint64_t pos = 0, gaps = 0, done = 0;
+    double t0 = Now();
+
+    while (pos < size) {
+        size_t want = (size_t)((size - pos) < CH ? (size - pos) : CH);
+        uint64_t a = addr + pos;
+
+        bool ok = kd.Read(pid, a, buf.data(), want);
+        if (!ok) {
+            size_t page = 0x1000;
+            for (size_t o = 0; o < want; o += page) {
+                size_t n = (want - o) < page ? (want - o) : page;
+                if (!kd.Read(pid, a + o, buf.data() + o, n)) {
+                    memset(buf.data() + o, 0, n);
+                    if (g) fprintf(g, "%llx\n", (unsigned long long)(a + o));
+                    ++gaps;
+                }
+            }
+        }
+        fwrite(buf.data(), 1, want, f);
+        pos += want;
+        done += want;
+
+        if ((pos & 0xFFFFFFF) == 0) {
+            double el = Now() - t0;
+            printf("   %6.1f / %6.1f MB   gaps=%llu   %5.1f MB/s\n",
+                   done / 1048576.0, size / 1048576.0,
+                   (unsigned long long)gaps, el > 0 ? (done / 1048576.0) / el : 0);
+            fflush(stdout);
+        }
+    }
+
+    fclose(f);
+    if (g) fclose(g);
+    printf("[+] Dumped %llu bytes -> %s  (gaps=%llu, %.1fs)\n",
+           (unsigned long long)size, outFile, (unsigned long long)gaps, Now() - t0);
+    return 0;
+}
+
 static int CmdDump(KernelDriver& kd, DWORD pid, uint64_t addr, uint64_t size,
                    const std::string& path) {
     std::vector<uint8_t> buf((size_t)size);
@@ -1367,6 +1421,10 @@ int main(int argc, char** argv) {
         rc = CmdScan(kd, pid, deep, extra);
     } else if (cmd == "meta") {
         rc = CmdMeta(kd, pid, deep);
+    } else if (cmd == "dumpsafe" && argc >= 5) {
+        rc = CmdDumpSafe(kd, pid, strtoull(argv[2], nullptr, 16),
+                         strtoull(argv[3], nullptr, 0), argv[4],
+                         argc >= 6 ? argv[5] : nullptr);
     } else if (cmd == "dump" && argc >= 5) {
         rc = CmdDump(kd, pid, strtoull(argv[2], nullptr, 16),
                      strtoull(argv[3], nullptr, 0), argv[4]);
