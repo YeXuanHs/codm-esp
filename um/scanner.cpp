@@ -784,7 +784,7 @@ static int CmdDiffScan(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end
 //     [X][0][Z]      [0][X][Z]      [X][Z][0]      [X][0][Z][pad]
 //
 // ------------------------------------------------------------
-static int static int CmdFindOffs(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
+static int CmdFindOffs(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
                        UINT32 count, UINT32 minFirst, UINT32 maxVal) {
     const uint64_t span = kPageSize + kPageOverlap;
     printf("[*] findoffs count=%u first<=%u max=%u over %016llX - %016llX\n",
