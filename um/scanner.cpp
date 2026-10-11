@@ -563,9 +563,13 @@ static int CmdSelfTest(KernelDriver& kd, DWORD pid) {
     else
         printf("[!] BatchRead FAILED (first byte 0x%02X)\n", page[0]);
 
-    // 4) magic scan over a range that definitely covers us
-    printf("[*] Scanning 0x10000 - 0x10000000 for the magic ...\n");
-    ScanRange(kd, pid, 0x10000, 0x10000000, "selftest");
+    // 4) magic scan over a window that definitely covers the planted blob
+    //    (VirtualAlloc under ASLR can land anywhere in the 128 TB range,
+    //     so scan around the actual address rather than a fixed window)
+    uint64_t winStart = (addr & ~0xFFFFull) - 0x100000ull;
+    uint64_t winEnd   = winStart + 0x200000ull;
+    printf("[*] Scanning around the blob for the magic ...\n");
+    ScanRange(kd, pid, winStart, winEnd, "selftest");
 
     // 5) dump the blob through the normal dumper
     CreateDirectoryA("out", nullptr);
