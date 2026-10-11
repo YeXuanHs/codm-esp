@@ -1337,7 +1337,9 @@ int main(int argc, char** argv) {
             if (a == "--px" && i + 1 < argc)      { refX = (float)atof(argv[++i]); useRef = true; }
             else if (a == "--pz" && i + 1 < argc) { refZ = (float)atof(argv[++i]); useRef = true; }
             else if (a == "--maxdist" && i + 1 < argc) { maxDist = (float)atof(argv[++i]); }
-            else if (a.size() && (isdigit((unsigned char)a[0]) || a[0] == '-' || a[0] == '.')) {
+            else if (a.size() > 1 && a[0] == '-' && a[1] == '-') {
+                // some other option - not a number
+            } else if (a.size() && (isdigit((unsigned char)a[0]) || a[0] == '.')) {
                 float v = (float)atof(argv[i]);
                 if (v >= 100.0f) hi = v; else lo = v;
             }
