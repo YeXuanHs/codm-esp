@@ -25,6 +25,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #pragma comment(lib, "ntdll.lib")
 
@@ -678,6 +679,99 @@ static int CmdFindOffsets(KernelDriver& kd, DWORD pid, uint64_t classAddr) {
 }
 
 // ------------------------------------------------------------
+// diffscan <start> <end> [batchKB] [delayMs]
+//
+// Blind differential scan: read a block, wait, read it again, and report
+// every 4-byte slot that moved. This finds live gameplay state (world
+// position, velocity, timers) without knowing which class owns it, which is
+// what we need on a build that hides the field-offset table.
+//
+// Only values that look like gameplay floats (finite, |v| in range) or small
+// ints are reported, otherwise every ticking counter drowns the output.
+// ------------------------------------------------------------
+static int CmdDiffScan(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
+                       size_t batchBytes, int delayMs) {
+    if (batchBytes < 0x1000) batchBytes = 0x40000;      // 256 KB
+    if (batchBytes > 0x100000) batchBytes = 0x100000;   // 1 MB cap
+    if (delayMs < 20) delayMs = 250;
+
+    const UINT32 pagesPerBatch = (UINT32)(batchBytes / kPageSize);
+    const size_t span = (size_t)pagesPerBatch * kPageSize;
+
+    std::vector<BatchReadRequest> reqs(pagesPerBatch);
+    std::vector<uint8_t> a(span), b(span);
+
+    printf("[*] diffscan %016llX - %016llX  batch=%zuKB delay=%dms\n",
+           (unsigned long long)start, (unsigned long long)end,
+           batchBytes / 1024, delayMs);
+    fflush(stdout);
+
+    uint64_t movedPages = 0, total = 0, hits = 0;
+    double t0 = Now();
+
+    for (uint64_t base = start; base < end; base += batchBytes) {
+        UINT32 np = 0;
+        for (; np < pagesPerBatch && base + np * kPageSize < end; ++np) {
+            reqs[np].address          = base + np * kPageSize;
+            reqs[np].size             = kPageSize;
+            reqs[np].offset_in_buffer = (SIZE_T)np * kPageSize;
+        }
+        if (!np) break;
+        size_t used = (size_t)np * kPageSize;
+
+        kd.BatchRead(pid, reqs.data(), np, a.data(), used);
+        Sleep(delayMs);
+        kd.BatchRead(pid, reqs.data(), np, b.data(), used);
+
+        bool pageMoved[4096] = {};
+        uint32_t pages = (UINT32)(used / kPageSize);
+
+        for (size_t o = 0; o + 4 <= used; o += 4) {
+            uint32_t x, y;
+            memcpy(&x, a.data() + o, 4);
+            memcpy(&y, b.data() + o, 4);
+            if (x == y) continue;
+
+            float fx, fy;
+            memcpy(&fx, &x, 4);
+            memcpy(&fy, &y, 4);
+
+            bool floatish = std::isfinite(fx) && std::isfinite(fy) &&
+                            (fabs(fx) < 100000.0f || fabs(fy) < 100000.0f);
+            bool smallish = (x < 1000000u) && (y < 1000000u);
+            if (!floatish && !smallish) continue;
+
+            size_t pageIdx = o / kPageSize;
+            if (pageIdx < pages) pageMoved[pageIdx] = true;
+
+            if (hits < 4000) {
+                printf("  CHG %016llX  %10.4f -> %10.4f   (0x%08X -> 0x%08X)\n",
+                       (unsigned long long)(base + o), (double)fx, (double)fy, x, y);
+            }
+            ++hits;
+        }
+
+        for (uint32_t p = 0; p < pages; ++p)
+            if (pageMoved[p]) ++movedPages;
+        total += pages;
+
+        if (((base - start) & 0x3FFF000ull) == 0) {
+            double el = Now() - t0;
+            double mb = (double)(base - start) / 1048576.0;
+            printf("   %7.1f MB  movedPages=%llu hits=%llu  %5.1f MB/s\n",
+                   mb, (unsigned long long)movedPages, (unsigned long long)hits,
+                   el > 0 ? mb / el : 0);
+            fflush(stdout);
+        }
+    }
+
+    printf("[=] done in %.1fs: %llu pages scanned, %llu moved, %llu slot changes\n",
+           Now() - t0, (unsigned long long)total,
+           (unsigned long long)movedPages, (unsigned long long)hits);
+    return 0;
+}
+
+// ------------------------------------------------------------
 // IL2CPP global-metadata header
 // ------------------------------------------------------------
 struct MetaHeader {
@@ -1142,6 +1236,12 @@ int main(int argc, char** argv) {
         uint64_t a = strtoull(argv[2], nullptr, 16);
         uint64_t n = argc >= 4 ? strtoull(argv[3], nullptr, 0) : 0x100;
         rc = CmdFindObj(kd, pid, a, (size_t)n);
+    } else if (cmd == "diffscan" && argc >= 3) {
+        uint64_t s = strtoull(argv[2], nullptr, 16);
+        uint64_t e = strtoull(argv[3], nullptr, 16);
+        size_t    b = argc >= 4 ? (size_t)strtoull(argv[4], nullptr, 0) : 0x40000;
+        int       d = argc >= 5 ? atoi(argv[5]) : 250;
+        rc = CmdDiffScan(kd, pid, s, e, b, d);
     } else if (cmd == "findoffsets" && argc >= 3) {
         rc = CmdFindOffsets(kd, pid, strtoull(argv[2], nullptr, 16));
     } else if (cmd == "findclass" && argc >= 3) {
