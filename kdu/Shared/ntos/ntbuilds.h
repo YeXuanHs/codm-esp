@@ -1,0 +1,139 @@
+/*******************************************************************************
+*
+*  (C) COPYRIGHT AUTHORS, 2021 - 2026
+*
+*  TITLE:       NTBUILDS.H
+*
+*  VERSION:     1.30
+*
+*  DATE:        31 Jul 2026
+*
+*  Windows NT builds definition file.
+*
+* THIS CODE AND INFORMATION IS PROVIDED "AS IS" WITHOUT WARRANTY OF
+* ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED
+* TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A
+* PARTICULAR PURPOSE.
+*
+*******************************************************************************/
+#pragma once
+
+//
+// Defines for Major Windows NT release builds
+//
+
+//
+// Archeology part START
+//
+
+// Windows NT 3.51
+#define NT_WIN_NT351            1057
+
+// Windows NT 4.0
+#define NT_WIN_NT4              1381
+
+// Windows 2000
+#define NT_WIN_2K               2195
+
+// Windows XP
+#define NT_WIN_XP               2600
+
+// Windows XP 64 uses same build as server
+#define NT_WIN_XP_64            3790
+
+// Windows 2003 (RTM/SP1)
+#define NT_WINSRV_2003          3790
+
+//
+// Archeology part END
+//
+
+// Windows Vista RTM
+#define NT_WIN_VISTA_RTM        6000
+
+// Windows Vista SP1
+#define NT_WIN_VISTA_SP1        6001
+
+// Windows Vista SP2
+#define NT_WIN_VISTA_SP2        6002
+
+// Windows 7 RTM
+#define NT_WIN7_RTM             7600
+
+// Windows 7 SP1
+#define NT_WIN7_SP1             7601
+
+// Windows 8 RTM
+#define NT_WIN8_RTM             9200
+
+// Windows 8.1
+#define NT_WIN8_BLUE            9600
+
+// Windows 10 TH1
+#define NT_WIN10_THRESHOLD1     10240
+
+// Windows 10 TH2
+#define NT_WIN10_THRESHOLD2     10586
+
+// Windows 10 RS1
+#define NT_WIN10_REDSTONE1      14393
+
+// Windows 10 RS2
+#define NT_WIN10_REDSTONE2      15063
+
+// Windows 10 RS3
+#define NT_WIN10_REDSTONE3      16299
+
+// Windows 10 RS4
+#define NT_WIN10_REDSTONE4      17134
+
+// Windows 10 RS5
+#define NT_WIN10_REDSTONE5      17763
+
+// Windows 10 19H1
+#define NT_WIN10_19H1           18362
+
+// Windows 10 19H2
+#define NT_WIN10_19H2           18363
+
+// Windows 10 20H1
+#define NT_WIN10_20H1           19041
+
+// Windows 10 20H2
+#define NT_WIN10_20H2           19042
+
+// Windows 10 21H1
+#define NT_WIN10_21H1           19043
+
+// Windows 10 21H2
+#define NT_WIN10_21H2           19044
+
+// Windows 10 22H2
+#define NT_WIN10_22H2           19045
+
+// Windows Server 2022
+#define NT_WINSRV_21H1          20348
+
+// Windows 11 21H2
+#define NT_WIN11_21H2           22000
+
+// Windows 11 22H2
+#define NT_WIN11_22H2           22621
+
+// Windows 11 23H2
+#define NT_WIN11_23H2           22631
+
+// Windows 11 24H2
+#define NT_WIN11_24H2           26100
+
+// Windows 11 25H2
+#define NT_WIN11_25H2           26200
+
+// Windows 11 26H1
+#define NT_WIN11_26H1           28000
+
+// Windows 11 26H2
+#define NT_WIN11_26H2           26300
+
+// Windows 11 Active Development Branch
+#define NT_WIN11_ADB            29595
