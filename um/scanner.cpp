@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 
 #pragma comment(lib, "ntdll.lib")
 
@@ -784,17 +785,21 @@ static int CmdDiffScan(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end
 //
 // ------------------------------------------------------------
 static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
-                      float minV, float maxV) {
+                      float minV, float maxV,
+                      bool useRef, float refX, float refZ, float maxDist) {
     const uint64_t span = kPageSize + kPageOverlap;
-    printf("[*] findpos %016llX - %016llX  range [%.0f, %.0f]\n",
+    printf("[*] findpos %016llX - %016llX  range [%.0f, %.0f]",
            (unsigned long long)start, (unsigned long long)end, minV, maxV);
+    if (useRef)
+        printf("  ref=(%.1f, %.1f) maxDist=%.1f", refX, refZ, maxDist);
+    printf("\n");
     fflush(stdout);
 
     std::vector<BatchReadRequest> reqs(kBatchPages);
     std::vector<uint8_t> buf((size_t)kBatchPages * span);
 
     uint64_t hits = 0, scanned = 0;
-    double t0 = Now();
+    double  t0 = Now();
 
     for (uint64_t base = start; base < end; base += (uint64_t)kBatchPages * kPageSize) {
         UINT32 np = 0;
@@ -816,28 +821,24 @@ static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
             memcpy(&b, buf.data() + o + 4, 4);
             memcpy(&c, buf.data() + o + 8, 4);
 
-            bool ok = false;
-            const char* form = "";
-            if (a != 0.0f && b == 0.0f && c != 0.0f) { ok = true; form = "X0Z"; }
-            else if (a == 0.0f && b != 0.0f && c != 0.0f) { ok = true; form = "0XZ"; }
-            else if (a != 0.0f && b != 0.0f && c == 0.0f) { ok = true; form = "XZ0"; }
-            if (!ok) continue;
+            // Only the strict (X, 0, Z) layout: a genuine world position has
+            // a zero height, and the two horizontal components differ.
+            if (!(a != 0.0f && b == 0.0f && c != 0.0f)) continue;
+            if (!(a >= minV && a <= maxV)) continue;
+            if (!(c >= minV && c <= maxV)) continue;
+            if (fabsf(a - c) < 1.0f) continue;          // reject (r, 0, r)
 
-            auto inRange = [&](float v) {
-                return v >= minV && v <= maxV && v == v && fabsf(v) < 1e7f;
-            };
-            if (form[0] == 'X' && form[1] == '0') {
-                if (!inRange(a) || !inRange(c)) continue;
-            } else if (form[0] == '0') {
-                if (!inRange(b) || !inRange(c)) continue;
+            if (useRef) {
+                float dx = a - refX, dz = c - refZ;
+                float dist = sqrtf(dx * dx + dz * dz);
+                if (dist > maxDist || dist < 0.5f) continue;
+                printf("  POS %016llX  (%9.2f, %9.2f, %9.2f)  dist=%.2f\n",
+                       (unsigned long long)(base + o), a, b, c, dist);
             } else {
-                if (!inRange(a) || !inRange(b)) continue;
+                printf("  POS %016llX  (%9.2f, %9.2f, %9.2f)\n",
+                       (unsigned long long)(base + o), a, b, c);
             }
-            if (hits < 3000) {
-                printf("  POS %016llX  %s  (%9.2f, %9.2f, %9.2f)\n",
-                       (unsigned long long)(base + o), form, a, b, c);
-                fflush(stdout);
-            }
+            fflush(stdout);
             ++hits;
         }
 
@@ -851,8 +852,7 @@ static int CmdFindPos(KernelDriver& kd, DWORD pid, uint64_t start, uint64_t end,
         }
     }
 
-    printf("[=] done in %.1fs: %llu position candidates\n", Now() - t0,
-           (unsigned long long)hits);
+    printf("[=] done in %.1fs: %llu candidates\n", Now() - t0, (unsigned long long)hits);
     return 0;
 }
 
@@ -1324,9 +1324,21 @@ int main(int argc, char** argv) {
     } else if (cmd == "findpos" && argc >= 3) {
         uint64_t s = strtoull(argv[2], nullptr, 16);
         uint64_t e = strtoull(argv[3], nullptr, 16);
-        float    lo = argc >= 4 ? (float)atof(argv[4]) : 20.0f;
-        float    hi = argc >= 5 ? (float)atof(argv[5]) : 9300.0f;
-        rc = CmdFindPos(kd, pid, s, e, lo, hi);
+        float    lo = 20.0f, hi = 9300.0f;
+        bool     useRef = false;
+        float    refX = 0, refZ = 0, maxDist = 100.0f;
+
+        for (int i = 4; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--px" && i + 1 < argc)      { refX = (float)atof(argv[++i]); useRef = true; }
+            else if (a == "--pz" && i + 1 < argc) { refZ = (float)atof(argv[++i]); useRef = true; }
+            else if (a == "--maxdist" && i + 1 < argc) { maxDist = (float)atof(argv[++i]); }
+            else if (a.size() && (isdigit((unsigned char)a[0]) || a[0] == '-' || a[0] == '.')) {
+                float v = (float)atof(argv[i]);
+                if (v >= 100.0f) hi = v; else lo = v;
+            }
+        }
+        rc = CmdFindPos(kd, pid, s, e, lo, hi, useRef, refX, refZ, maxDist);
     } else if (cmd == "diffscan" && argc >= 3) {
         uint64_t s = strtoull(argv[2], nullptr, 16);
         uint64_t e = strtoull(argv[3], nullptr, 16);
